@@ -5,15 +5,16 @@ import numpy as np
 import nibabel as nib
 from typing import Tuple, Optional
 
-# Importa le funzioni di DIPY per la compatibilità
+# Import DIPY functions for compatibility
 try:
     from dipy.io.image import load_nifti
     from dipy.io import read_bvals_bvecs
     from dipy.core.gradients import gradient_table, GradientTable
 except ImportError:
-    print("ATTENZIONE: DIPY non trovato. Alcune funzioni di utilità potrebbero non funzionare.")
-    print("Installa con: pip install dipy")
-    # Definisci tipi fittizi per evitare errori di importazione
+    print("WARNING: DIPY not found. Some utility functions may not work.")
+    print("Install with: pip install dipy")
+    
+    # Create a dummy type to avoid import errors if dipy isn't present
     GradientTable = type("GradientTable", (object,), {})
 
 
@@ -24,44 +25,44 @@ def load_dwi_data_dipy(
     f_mask: Optional[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, GradientTable, Optional[np.ndarray]]:
     """
-    Carica dati DWI, bvals, bvecs e una maschera opzionale usando DIPY.
+    Loads DWI data, bvals, bvecs, and an optional mask using DIPY.
     
     Args:
-        f_nifti: Percorso al file NIfTI 4D (.nii o .nii.gz)
-        f_bval: Percorso al file .bval
-        f_bvec: Percorso al file .bvec
-        f_mask: Percorso opzionale al file NIfTI della maschera 3D
+        f_nifti: Path to the 4D NIfTI file (.nii or .nii.gz)
+        f_bval: Path to the .bval file
+        f_bvec: Path to the .bvec file
+        f_mask: Optional path to the 3D NIfTI mask file
         
     Returns:
-        Tupla contenente:
-        - data (np.ndarray): Dati DWI 4D
-        - affine (np.ndarray): Matrice affine
-        - gtab (GradientTable): Oggetto gradient table di DIPY
-        - mask (np.ndarray | None): Maschera 3D booleana o None
+        A tuple containing:
+        - data (np.ndarray): 4D DWI data
+        - affine (np.ndarray): Affine matrix
+        - gtab (GradientTable): DIPY gradient table object
+        - mask (np.ndarray | None): 3D boolean mask or None
     """
-    print(f"[Utils] Caricamento dati da: {f_nifti}")
+    print(f"[Utils] Loading data from: {f_nifti}")
     data, affine = load_nifti(f_nifti)
     
-    print(f"[Utils] Caricamento bvals/bvecs da: {f_bval}, {f_bvec}")
+    print(f"[Utils] Loading bvals/bvecs from: {f_bval}, {f_bvec}")
     bvals, bvecs = read_bvals_bvecs(f_bval, f_bvec)
     gtab = gradient_table(bvals, bvecs)
     
     print(f"  ✓ Volume: {data.shape}, Bvals: {len(gtab.bvals)}, Bvecs: {gtab.bvecs.shape}")
-    print(f"  ✓ N. volumi b=0: {np.sum(gtab.b0s_mask)}")
+    print(f"  ✓ No. of b=0 volumes: {np.sum(gtab.b0s_mask)}")
     
     mask_data = None
     if f_mask:
-        print(f"[Utils] Caricamento maschera da: {f_mask}")
+        print(f"[Utils] Loading mask from: {f_mask}")
         mask_data, mask_affine = load_nifti(f_mask)
         mask_data = mask_data.astype(bool)
         
-        # Validazione
+        # Validation
         if mask_data.shape != data.shape[:3]:
             raise ValueError(
-                f"La forma della maschera {mask_data.shape} non corrisponde "
-                f"alla forma dei dati {data.shape[:3]}"
+                f"Mask shape {mask_data.shape} does not match "
+                f"data shape {data.shape[:3]}"
             )
-        print(f"  ✓ Maschera: {mask_data.shape}, Voxel: {np.sum(mask_data):,}")
+        print(f"  ✓ Mask: {mask_data.shape}, Voxels: {np.sum(mask_data):,}")
     
     return data, affine, gtab, mask_data
 
@@ -73,28 +74,28 @@ def save_parameter_maps(
     prefix: str = 'dbsi'
 ):
     """
-    Salva le mappe parametriche come file NIfTI
-    (Funzione dal tuo script MODELLO FULL)
+    Saves parameter maps as NIfTI files
+    (Function from your FULL MODEL script)
     
     Args:
-        param_maps: Dizionario con le mappe parametriche
-        affine: Matrice affine dal volume originale
-        output_dir: Directory di output
-        prefix: Prefisso per i file
+        param_maps: Dictionary with the parameter maps
+        affine: Affine matrix from the original volume
+        output_dir: Output directory
+        prefix: Prefix for the output files
     """
     os.makedirs(output_dir, exist_ok=True)
     
     saved_count = 0
-    print(f"\n[Utils] Salvataggio di {len(param_maps)} mappe in: {output_dir}")
+    print(f"\n[Utils] Saving {len(param_maps)} maps to: {output_dir}")
     
     for param_name, param_data in param_maps.items():
         try:
-            # Assicura che i dati siano float32 per il salvataggio
+            # Ensure data is float32 for saving
             img = nib.Nifti1Image(param_data.astype(np.float32), affine)
             filename = os.path.join(output_dir, f'{prefix}_{param_name}.nii.gz')
             nib.save(img, filename)
             saved_count += 1
         except Exception as e:
-            print(f"  ! Errore nel salvataggio di {param_name}: {e}")
+            print(f"  ! Error saving {param_name}: {e}")
     
-    print(f"  ✓ Salvate {saved_count} mappe parametriche.")
+    print(f"  ✓ Saved {saved_count} parameter maps.")

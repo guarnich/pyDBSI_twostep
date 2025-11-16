@@ -25,7 +25,7 @@ pip install -e .
 
 This is the most robust method for integrating into automated pipelines (e..g., Bash scripts, SLURM).
 
-**Script:** `run_dbsi_cli.py`
+**Script:** `run_dbsi.py`
 
 ### How to Run
 

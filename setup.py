@@ -6,7 +6,7 @@ setup(
     description='Python toolbox for fitting the Diffusion Basis Spectrum Imaging (DBSI) model.',
     author='Francesco Guarnaccia',
     author_email='francesco.guarnaccia@univr.it',
-    url='https://github.com/guarnich/dbsi-fitting-toolbox', # URL della tua repo
+    url='https://github.com/guarnich/dbsi-fitting-toolbox', 
     packages=find_packages(),
     install_requires=[
         'numpy',
@@ -17,7 +17,7 @@ setup(
     ],
     classifiers=[
         'Programming Language :: Python :: 3',
-        'License :: OSI Approved :: MIT License', # O la licenza che hai scelto
+        'License :: OSI Approved :: MIT License', 
         'Operating System :: OS Independent',
         'Intended Audience :: Science/Research',
         'Topic :: Scientific/Engineering :: Medical Science Apps.'
