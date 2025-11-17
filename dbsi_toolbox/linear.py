@@ -1,4 +1,5 @@
 # dbsi_toolbox/linear.py
+
 import numpy as np
 from scipy.optimize import nnls
 from typing import Tuple
@@ -8,7 +9,7 @@ from .common import DBSIParams
 class DBSI_Linear(BaseDBSI):
     """
     DBSI implementation using Linear Basis Spectrum and NNLS.
-    Best for speed and stability.
+    Best for speed and stability. Robust against solver failures.
     """
     def __init__(self, 
                  iso_diffusivity_range: Tuple[float, float] = (0.0, 3.0e-3),
@@ -29,11 +30,9 @@ class DBSI_Linear(BaseDBSI):
         """
         Override to build the design matrix once before iteration.
         """
-        # Ensure format consistency
         flat_bvals = np.array(bvals).flatten()
         N = len(flat_bvals)
         
-        # Standardize bvecs shape locally before calling super
         if bvecs.shape == (3, N):
             current_bvecs = bvecs.T
         else:
@@ -43,7 +42,6 @@ class DBSI_Linear(BaseDBSI):
         self.design_matrix = self._build_design_matrix(flat_bvals, current_bvecs)
         print(" Done.")
         
-        # Call the parent class to handle the loop
         return super().fit_volume(volume, bvals, bvecs, **kwargs)
 
     def _build_design_matrix(self, bvals: np.ndarray, bvecs: np.ndarray) -> np.ndarray:
@@ -78,19 +76,33 @@ class DBSI_Linear(BaseDBSI):
         if self.design_matrix is None:
             raise RuntimeError("Design matrix not built.")
 
+        # --- ROBUSTNESS CHECK 1: Check for NaNs/Infs ---
+        if not np.all(np.isfinite(signal)):
+             return self._get_empty_params()
+
         # Signal Normalization
         if np.any(bvals < 50):
             S0 = np.mean(signal[bvals < 50])
         else:
             S0 = signal[0]
             
-        if S0 <= 1e-6 or np.any(np.isnan(signal)):
+        # --- ROBUSTNESS CHECK 2: Check for bad S0 ---
+        if S0 <= 1e-6:
             return self._get_empty_params()
             
         y = signal / S0
         
-        # NNLS Solver
-        weights, _ = nnls(self.design_matrix, y)
+        # --- ROBUSTNESS CHECK 3: Solver Error Handling ---
+        try:
+            # Solve argmin_x || Ax - y ||_2 subject to x >= 0
+            weights, _ = nnls(self.design_matrix, y)
+        except RuntimeError:
+            # This catches "Maximum number of iterations reached"
+            # We return an empty result for this bad voxel
+            return self._get_empty_params()
+        except Exception:
+            # Catches any other unexpected solver error
+            return self._get_empty_params()
         
         # Extract Metrics
         n_aniso = len(self.current_bvecs)
@@ -119,7 +131,7 @@ class DBSI_Linear(BaseDBSI):
         mask_wat = self.iso_diffusivities > 2.0e-3
         f_water = np.sum(iso_weights[mask_wat])
         
-        # R-Squared
+        # R-Squared calculation
         predicted = self.design_matrix @ weights
         ss_res = np.sum((y - predicted)**2)
         ss_tot = np.sum((y - np.mean(y))**2)
