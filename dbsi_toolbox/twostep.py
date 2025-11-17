@@ -22,8 +22,8 @@ class DBSI_TwoStep(BaseDBSI):
                  axial_diff_basis=1.5e-3,
                  radial_diff_basis=0.3e-3):
         
-        # --- AGGIORNAMENTO CLASSI ---
-        self.spectrum_model = DBSI_BasisSpectrum(  # Ex linear_model
+        # Inizializza i due modelli interni
+        self.spectrum_model = DBSI_BasisSpectrum(
             iso_diffusivity_range=iso_diffusivity_range,
             n_iso_bases=n_iso_bases,
             axial_diff_basis=axial_diff_basis,
@@ -32,30 +32,51 @@ class DBSI_TwoStep(BaseDBSI):
             filter_threshold=filter_threshold
         )
         
-        self.fitting_model = DBSI_TensorFit()      # Ex nonlinear_model
+        self.fitting_model = DBSI_TensorFit()
         
     def fit_volume(self, volume, bvals, bvecs, **kwargs):
-        # ... (codice di setup bvals/bvecs invariato) ...
+        """
+        Overrides fit_volume to setup the Design Matrix first.
+        """
+        # --- 1. PREPARAZIONE DATI LOCALE ---
+        # Necessario perché dobbiamo usare questi dati PRIMA di chiamare super()
+        flat_bvals = np.array(bvals).flatten()
+        N = len(flat_bvals)
+        
+        # Standardizziamo i bvecs (N, 3)
+        if bvecs.shape == (3, N):
+            current_bvecs = bvecs.T
+        else:
+            current_bvecs = bvecs
             
+        # --- 2. COSTRUZIONE MATRICE (Step Spectrum) ---
         print("Step 1/2: Pre-calculating Basis Spectrum Matrix...", end="")
-        # Usa self.spectrum_model invece di self.linear_model
+        
+        # Costruiamo la matrice usando i dati appena preparati
         self.spectrum_model.design_matrix = self.spectrum_model._build_design_matrix(flat_bvals, current_bvecs)
         
+        # Condividiamo i vettori correnti con i sottomodelli
         self.spectrum_model.current_bvecs = current_bvecs
         self.fitting_model.current_bvecs = current_bvecs
         print(" Done.")
         
         print("Step 2/2: Running Two-Step DBSI...")
+        
+        # --- 3. AVVIO CICLO (Base Class) ---
+        # Passiamo tutto alla classe base che gestisce il loop tqdm
         return super().fit_volume(volume, bvals, bvecs, **kwargs)
 
     def fit_voxel(self, signal: np.ndarray, bvals: np.ndarray) -> DBSIParams:
-        # --- STEP 1: Basis Spectrum ---
+        # --- STEP 1: Basis Spectrum (NNLS) ---
+        # Trova rapidamente le frazioni e le direzioni principali
         spectrum_result = self.spectrum_model.fit_voxel(signal, bvals)
         
+        # Se il fit lineare fallisce (es. voxel vuoto), saltiamo il non-lineare
         if spectrum_result.f_fiber == 0 and spectrum_result.f_iso_total == 0:
             return spectrum_result
             
-        # --- STEP 2: Tensor Fit ---
+        # --- STEP 2: Tensor Fit (NLLS) ---
+        # Usa il risultato dello spettro come "initial guess" per raffinare i parametri
         final_result = self.fitting_model.fit_voxel(signal, bvals, initial_guess=spectrum_result)
         
         return final_result
