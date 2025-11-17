@@ -36,10 +36,7 @@ def main():
 
     # Optional Arguments
     opt = parser.add_argument_group('Optional Arguments')
-    opt.add_argument('--prefix', type=str, default='dbsi_cli', help="Prefix for output files (default: 'dbsi_cli')")
-    opt.add_argument('--method', type=str, default='least_squares', 
-                       choices=['least_squares', 'differential_evolution'],
-                       help="Optimization algorithm (default: 'least_squares')")
+    opt.add_argument('--prefix', type=str, default='dbsi_', help="Prefix for output files (default: 'dbsi_')")
     
     args = parser.parse_args()
 
