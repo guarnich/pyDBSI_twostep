@@ -5,8 +5,6 @@ setup(
     version="0.2.0",  # Aggiornata per includere DL e Calibrazione
     author="Francesco Guarnaccia",
     description="A comprehensive toolbox for Diffusion Basis Spectrum Imaging (Standard & Deep Learning)",
-    long_description=open("README.md").read() if "README.md" in open(".").read() else "",
-    long_description_content_type="text/markdown",
     url="https://github.com/guarnich/pyDBSI",
     packages=find_packages(),
     classifiers=[
