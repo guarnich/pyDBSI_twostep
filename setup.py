@@ -1,26 +1,30 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='dbsi_toolbox',
-    version='0.1.0',
-    description='Python toolbox for fitting the Diffusion Basis Spectrum Imaging (DBSI) model.',
-    author='Francesco Guarnaccia',
-    author_email='francesco.guarnaccia@univr.it',
-    url='https://github.com/guarnich/dbsi-fitting-toolbox', 
+    name="dbsi_toolbox",
+    version="0.2.0",  # Aggiornata per includere DL e Calibrazione
+    author="Francesco Guarnaccia",
+    description="A comprehensive toolbox for Diffusion Basis Spectrum Imaging (Standard & Deep Learning)",
+    long_description=open("README.md").read() if "README.md" in open(".").read() else "",
+    long_description_content_type="text/markdown",
+    url="https://github.com/guarnich/pyDBSI",
     packages=find_packages(),
-    install_requires=[
-        'numpy',
-        'scipy',
-        'nibabel',
-        'dipy',
-        'tqdm'
-    ],
     classifiers=[
-        'Programming Language :: Python :: 3',
-        'License :: OSI Approved :: MIT License', 
-        'Operating System :: OS Independent',
-        'Intended Audience :: Science/Research',
-        'Topic :: Scientific/Engineering :: Medical Science Apps.'
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+        "Topic :: Scientific/Engineering :: Bio-Informatics",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
     python_requires='>=3.8',
+    install_requires=[
+        "numpy",
+        "scipy",
+        "nibabel",
+        "dipy",
+        "tqdm",
+        "pandas",
+        "matplotlib",
+        "torch",  
+    ],
 )
