@@ -16,8 +16,6 @@ class DBSI_PhysicsDecoder(nn.Module):
     """
     Physics-Informed Decoder (Non-trainable).
     Implements the exact DBSI equation (Wang et al., 2011).
-    Acts as a "physical" loss function: transforms predicted parameters
-    into a synthetic MRI signal to be compared with the real one.
     """
     def __init__(self, bvals: np.ndarray, bvecs: np.ndarray, n_iso_bases: int = 50):
         super().__init__()
@@ -82,12 +80,11 @@ class DBSI_RegularizedMLP(nn.Module):
         self.n_output = n_iso_bases + 5 
         
         # "Bottleneck" architecture to force information compression
-        # and filter out noise.
         self.net = nn.Sequential(
             nn.Linear(n_input_meas, 128),
-            nn.LayerNorm(128),           # Normalization for stability
+            nn.LayerNorm(128),
             nn.ELU(),
-            nn.Dropout(dropout_rate),    # Stochastic regularization
+            nn.Dropout(dropout_rate),
             
             nn.Linear(128, 64),
             nn.LayerNorm(64),
@@ -105,7 +102,7 @@ class DBSI_RegularizedMLP(nn.Module):
         # --- Physical Constraints (Hard Regularization) ---
         
         # 1. Fractions (must sum to 1)
-        # Use Softmax over ALL fractions (isotropic + fiber)
+        # Use Softmax over ALL fractions (isotropic + fiber) to force competition
         fractions_raw = raw[:, :self.n_iso + 1]
         fractions = torch.softmax(fractions_raw, dim=1)
         
@@ -116,13 +113,22 @@ class DBSI_RegularizedMLP(nn.Module):
         theta = self.sigmoid(raw[:, self.n_iso + 1]) * np.pi        # [0, pi]
         phi   = (self.sigmoid(raw[:, self.n_iso + 2]) - 0.5) * 2 * np.pi # [-pi, pi]
         
-        # 3. Diffusivities (Constrained to human physiological ranges)
-        # Prevents fit "explosion" to non-physical values to fit noise
-        d_ax = self.sigmoid(raw[:, self.n_iso + 3]) * 3.0e-3    # Max 3.0 um2/ms
-        d_rad = self.sigmoid(raw[:, self.n_iso + 4]) * 3.0e-3
+        # 3. Diffusivities (STRICT CONSTRAINTS)
+        # Force fiber geometry to be "tube-like" (Anisotropic)
         
-        # Additional constraint: D_ax >= D_rad (definition of fiber)
-        d_ax = torch.max(d_ax, d_rad + 1e-6) # +epsilon for numerical stability
+        # D_ax: Must be high (e.g. > 1.0 um2/ms).
+        # Sigmoid (0-1) * 2.0 + 1.0 -> Range [1.0, 3.0]
+        d_ax_raw = self.sigmoid(raw[:, self.n_iso + 3])
+        d_ax = (d_ax_raw * 2.0e-3) + 1.0e-3    
+        
+        # D_rad: Must be low (e.g. < 0.8 um2/ms).
+        # Sigmoid (0-1) * 0.8 -> Range [0.0, 0.8]
+        d_rad_raw = self.sigmoid(raw[:, self.n_iso + 4])
+        d_rad = d_rad_raw * 0.8e-3
+
+        # Safety Check: D_ax must always be > D_rad + significant margin
+        # This prevents the fiber from becoming a "ball" (isotropic)
+        d_ax = torch.max(d_ax, d_rad + 0.5e-3) 
 
         return torch.cat([
             f_iso, 
@@ -137,14 +143,13 @@ class DBSI_RegularizedMLP(nn.Module):
 class DBSI_DeepSolver:
     """
     Self-Supervised Solver with Denoising Regularization.
-    Learns from patient-specific data.
     """
     def __init__(self, 
-                 n_iso_bases: int = 50, 
-                 epochs: int = 100, 
+                 n_iso_bases: int = 20,  # Reduced default to avoid overfitting noise
+                 epochs: int = 150,      # Slightly increased
                  batch_size: int = 2048, 
                  learning_rate: float = 1e-3,
-                 noise_injection_level: float = 0.02): # 2% noise injection
+                 noise_injection_level: float = 0.02):
         
         self.n_iso_bases = n_iso_bases
         self.epochs = epochs
@@ -154,20 +159,25 @@ class DBSI_DeepSolver:
         
     def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
         
-        print(f"[DeepSolver] Starting self-supervised training on device: {DEVICE}")
+        print(f"[DeepSolver] Starting training on device: {DEVICE}")
+        print(f"[DeepSolver] Constraints: D_ax [1.0-3.0], D_rad [0.0-0.8], Gap > 0.5")
         
         # 1. Data Preparation
         X_vol, Y_vol, Z_vol, N_meas = volume.shape
         valid_signals = volume[mask]
         
-        # Robust S0 normalization
+        # Robust Normalization and Cleaning
+        # Remove NaNs and Infs that break training
+        valid_signals = np.nan_to_num(valid_signals, nan=0.0, posinf=0.0, neginf=0.0)
+        # Remove negative values (physically impossible for magnitude signal)
+        valid_signals = np.maximum(valid_signals, 0.0)
+        
         b0_idx = np.where(bvals < 50)[0]
         if len(b0_idx) > 0:
             s0 = np.mean(valid_signals[:, b0_idx], axis=1, keepdims=True)
-            # Avoid division by zero and suppress background
-            s0[s0 < 1e-3] = 1.0 
+            s0[s0 < 1e-3] = 1.0 # Avoid division by zero
             valid_signals = valid_signals / s0
-            # Clip to remove extreme outliers before training
+            # Clip normalized signal (values > 1.5 are likely artifacts or noise)
             valid_signals = np.clip(valid_signals, 0, 1.5)
         
         # PyTorch Dataset
@@ -187,14 +197,13 @@ class DBSI_DeepSolver:
             n_iso_bases=self.n_iso_bases
         ).to(DEVICE)
         
-        # Optimizer with Weight Decay (L2 Regularization)
         optimizer = optim.AdamW(encoder.parameters(), lr=self.lr, weight_decay=1e-4)
         
-        # Loss Function: L1 Loss is more robust to outliers than MSE
+        # Loss Function: L1 for robustness
         loss_fn = nn.L1Loss()
         
-        # 3. Training Loop with Denoising
-        print(f"[DeepSolver] Training on {len(valid_signals)} voxels (Epochs={self.epochs})...")
+        # 3. Training Loop
+        print(f"[DeepSolver] Training on {len(valid_signals)} voxels...")
         encoder.train()
         
         for epoch in range(self.epochs):
@@ -203,22 +212,27 @@ class DBSI_DeepSolver:
             for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False, file=sys.stdout):
                 clean_signal = batch[0].to(DEVICE)
                 
-                # --- TECHNIQUE: Denoising Autoencoder ---
-                # We add noise to the input, but calculate loss on clean signal.
-                # This forces the network to learn underlying structure and ignore noise.
+                # Denoising: Noisy Input -> Clean Target
                 noise = torch.randn_like(clean_signal) * self.noise_level
                 noisy_input = clean_signal + noise
                 
                 optimizer.zero_grad()
                 
-                # A. Parameter Prediction (from noisy input)
+                # Forward
                 params_pred = encoder(noisy_input)
-                
-                # B. Physical Reconstruction (theoretical signal)
                 signal_recon = decoder(params_pred)
                 
-                # C. Loss (compare with original patient signal)
-                loss = loss_fn(signal_recon, clean_signal)
+                # Loss 1: Reconstruction
+                recon_loss = loss_fn(signal_recon, clean_signal)
+                
+                # Loss 2: Sparsity (New)
+                # Punishes unnecessary activation of multiple isotropic compartments
+                # Helps push unneeded fractions to zero (soft zeros -> hard zeros)
+                fractions_iso = params_pred[:, :self.n_iso_bases]
+                sparsity_loss = 1e-5 * torch.sum(torch.abs(fractions_iso))
+                
+                # Total Loss
+                loss = recon_loss + sparsity_loss
                 
                 loss.backward()
                 optimizer.step()
@@ -226,9 +240,9 @@ class DBSI_DeepSolver:
                 epoch_loss += loss.item()
             
             if (epoch + 1) % 10 == 0:
-                print(f"  Epoch {epoch+1}: Loss = {epoch_loss / len(dataloader):.6f}")
+                print(f"  Epoch {epoch+1}: Avg Loss = {epoch_loss / len(dataloader):.6f}")
         
-        # 4. Final Inference (without dropout/noise)
+        # 4. Inference
         print("[DeepSolver] Generating volumetric maps...")
         encoder.eval()
         full_loader = DataLoader(dataset, batch_size=self.batch_size*2, shuffle=False)
@@ -242,27 +256,21 @@ class DBSI_DeepSolver:
                 
         flat_results = np.concatenate(all_preds, axis=0)
         
-        # 5. 3D Reconstruction and Metric Aggregation
-        print("[DeepSolver] Aggregating DBSI metrics...")
-        n_iso = self.n_iso_bases
-        
-        # 3D map helper
+        # 5. Reconstruction
         def to_3d(flat_arr):
             vol = np.zeros((X_vol, Y_vol, Z_vol), dtype=np.float32)
             vol[mask] = flat_arr
             return vol
             
-        # Extract components
-        iso_weights = flat_results[:, :n_iso]
-        fiber_frac  = flat_results[:, n_iso]
-        theta       = flat_results[:, n_iso+1]
-        phi         = flat_results[:, n_iso+2]
-        d_ax        = flat_results[:, n_iso+3]
-        d_rad       = flat_results[:, n_iso+4]
+        iso_weights = flat_results[:, :self.n_iso_bases]
+        fiber_frac  = flat_results[:, self.n_iso_bases]
+        theta       = flat_results[:, self.n_iso_bases+1]
+        phi         = flat_results[:, self.n_iso_bases+2]
+        d_ax        = flat_results[:, self.n_iso_bases+3]
+        d_rad       = flat_results[:, self.n_iso_bases+4]
         
-        # Spectral Aggregation (Restricted / Hindered / Free)
-        # Grid is linear from 0 to 3.0
-        grid = np.linspace(0, 3.0e-3, n_iso)
+        # Spectral Aggregation
+        grid = np.linspace(0, 3.0e-3, self.n_iso_bases)
         mask_res = grid <= 0.3e-3
         mask_hin = (grid > 0.3e-3) & (grid <= 2.0e-3)
         mask_wat = grid > 2.0e-3
@@ -271,7 +279,7 @@ class DBSI_DeepSolver:
         f_hin = np.sum(iso_weights[:, mask_hin], axis=1)
         f_wat = np.sum(iso_weights[:, mask_wat], axis=1)
         
-        # Direction Conversion
+        # Directions
         dir_x = np.sin(theta) * np.cos(phi)
         dir_y = np.sin(theta) * np.sin(phi)
         dir_z = np.cos(theta)
