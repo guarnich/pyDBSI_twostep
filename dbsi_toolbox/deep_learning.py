@@ -59,8 +59,9 @@ class DBSI_PhysicsDecoder(nn.Module):
 
 class DBSI_RegularizedMLP(nn.Module):
     """
-    MLP Encoder with Delta-Parameterization.
-    Prevents 'dead gradients' by modeling D_ax as (D_rad + Delta).
+    MLP Encoder with Hierarchical Fraction Estimation.
+    Decouples Fiber fraction prediction from Isotropic distribution to prevent
+    dilution of the fiber signal in the early training stages.
     """
     def __init__(self, n_input_meas: int, n_iso_bases: int = 50, dropout_rate: float = 0.1):
         super().__init__()
@@ -86,31 +87,35 @@ class DBSI_RegularizedMLP(nn.Module):
     def forward(self, x):
         raw = self.net(x)
         
-        # 1. Fractions
-        fractions_raw = raw[:, :self.n_iso + 1]
-        fractions = torch.softmax(fractions_raw, dim=1)
+        # --- 1. Hierarchical Fractions (The Fix) ---
+        # Instead of one big Softmax, we split the decision:
+        # A) How much is Fiber? (Sigmoid -> starts at 0.5 probability)
+        f_fiber_prob = self.sigmoid(raw[:, self.n_iso])
         
-        f_iso = fractions[:, :self.n_iso]
-        f_fiber = fractions[:, self.n_iso]
+        # B) How is the REST distributed among isotropic bases? (Softmax)
+        # We allocate the remaining probability (1 - f_fiber) to the isotropic spectrum
+        f_iso_total_prob = 1.0 - f_fiber_prob
+        iso_logits = raw[:, :self.n_iso]
+        iso_distribution = torch.softmax(iso_logits, dim=1)
         
-        # 2. Angles
+        # Combine: f_iso_i = (1 - f_fiber) * distribution_i
+        f_iso = f_iso_total_prob.unsqueeze(1) * iso_distribution
+        
+        # Ensure flat fiber fraction for output concatenation
+        f_fiber = f_fiber_prob
+        
+        # --- 2. Angles ---
         theta = self.sigmoid(raw[:, self.n_iso + 1]) * np.pi        
         phi   = (self.sigmoid(raw[:, self.n_iso + 2]) - 0.5) * 2 * np.pi
         
-        # 3. Diffusivities (DELTA PARAMETERIZATION)
-        # This ensures D_ax > D_rad mathematically, without breaking gradients.
-        
-        # D_rad: [0.0 - 1.5] (Matches Two-Step NLLS range)
-        # Increased from 0.8/1.0 to allow fitting demyelinated/oedematous fibers
+        # --- 3. Diffusivities (Delta-Parametrization from previous step) ---
+        # We keep this because it works well for the means.
         d_rad_raw = self.sigmoid(raw[:, self.n_iso + 4])
         d_rad = d_rad_raw * 1.5e-3 
 
-        # Delta: [0.1 - 2.5] (Anisotropy Gap)
-        # Min gap 0.1 ensures it's never perfectly isotropic (avoids confusion with Hindered)
         delta_raw = self.sigmoid(raw[:, self.n_iso + 3])
-        d_delta = (delta_raw * 2.4e-3) + 0.1e-3
+        d_delta = (delta_raw * 2.4e-3) + 0.1e-3 # Gap 0.1 to force anisotropy
         
-        # D_ax is derived
         d_ax = d_rad + d_delta
 
         return torch.cat([
@@ -121,7 +126,6 @@ class DBSI_RegularizedMLP(nn.Module):
             d_ax.unsqueeze(1), 
             d_rad.unsqueeze(1)
         ], dim=1)
-
 
 class DBSI_DeepSolver:
     """
