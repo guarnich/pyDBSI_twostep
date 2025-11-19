@@ -31,8 +31,6 @@ class DBSI_PhysicsDecoder(nn.Module):
         self.n_iso = n_iso_bases
 
     def forward(self, params: torch.Tensor) -> torch.Tensor:
-        # Unpacking parameters predicted by the encoder
-        # params: [f_iso (N), f_fiber (1), theta, phi, D_ax, D_rad]
         f_iso_weights = params[:, :self.n_iso]
         f_fiber       = params[:, self.n_iso]
         theta         = params[:, self.n_iso + 1]
@@ -41,29 +39,21 @@ class DBSI_PhysicsDecoder(nn.Module):
         d_rad         = params[:, self.n_iso + 4]
 
         # 1. Anisotropic Component (Fibers)
-        # Spherical angles to Cartesian vector conversion
         fiber_dir = torch.stack([
             torch.sin(theta) * torch.cos(phi),
             torch.sin(theta) * torch.sin(phi),
             torch.cos(theta)
         ], dim=1)
 
-        # Calculate Apparent Diffusion Coefficient (D_app) for each gradient direction
-        # cos_alpha = dot(fiber_dir, gradient_dir)
         cos_angle = torch.matmul(fiber_dir, self.bvecs.T)
         d_app_fiber = d_rad.unsqueeze(1) + (d_ax.unsqueeze(1) - d_rad.unsqueeze(1)) * (cos_angle ** 2)
         
-        # Fiber signal: f_fib * exp(-b * D_app)
         signal_fiber = f_fiber.unsqueeze(1) * torch.exp(-self.bvals.unsqueeze(0) * d_app_fiber)
 
         # 2. Isotropic Component (Spectrum)
-        # Isotropic basis matrix: exp(-b * D_iso)
         basis_iso = torch.exp(-torch.ger(self.bvals, self.iso_diffusivities))
-        
-        # Isotropic signal: weighted sum of bases
         signal_iso = torch.matmul(f_iso_weights, basis_iso.T)
 
-        # 3. Total Signal
         return signal_fiber + signal_iso
 
 
@@ -75,11 +65,8 @@ class DBSI_RegularizedMLP(nn.Module):
     def __init__(self, n_input_meas: int, n_iso_bases: int = 50, dropout_rate: float = 0.1):
         super().__init__()
         self.n_iso = n_iso_bases
-        
-        # Total output neurons
         self.n_output = n_iso_bases + 5 
         
-        # "Bottleneck" architecture to force information compression
         self.net = nn.Sequential(
             nn.Linear(n_input_meas, 128),
             nn.LayerNorm(128),
@@ -99,37 +86,31 @@ class DBSI_RegularizedMLP(nn.Module):
     def forward(self, x):
         raw = self.net(x)
         
-        # --- Physical Constraints (Hard Regularization) ---
-        
-        # 1. Fractions (must sum to 1)
-        # Use Softmax over ALL fractions (isotropic + fiber)
+        # 1. Fractions
         fractions_raw = raw[:, :self.n_iso + 1]
         fractions = torch.softmax(fractions_raw, dim=1)
         
         f_iso = fractions[:, :self.n_iso]
         f_fiber = fractions[:, self.n_iso]
         
-        # 2. Angles (Constrained to geometric range)
-        theta = self.sigmoid(raw[:, self.n_iso + 1]) * np.pi        # [0, pi]
-        phi   = (self.sigmoid(raw[:, self.n_iso + 2]) - 0.5) * 2 * np.pi # [-pi, pi]
+        # 2. Angles
+        theta = self.sigmoid(raw[:, self.n_iso + 1]) * np.pi        
+        phi   = (self.sigmoid(raw[:, self.n_iso + 2]) - 0.5) * 2 * np.pi
         
-        # 3. Diffusivities (STRICT CONSTRAINTS)
-        # Force fiber geometry to be "tube-like" (Anisotropic)
+        # 3. Diffusivities (RELAXED CONSTRAINTS)
+        # Modifica: Rilassiamo i vincoli per catturare fibre danneggiate
         
-        # D_ax: Must be high (e.g. > 0.8 um2/ms to allow injured axons).
-        # Sigmoid (0-1) * 2.2 + 0.8 -> Range [0.8, 3.0]
-        # Ho allargato leggermente il range inferiore (da 1.0 a 0.8) per accomodare fibre leggermente danneggiate
+        # D_ax: [0.5 - 3.0] (Abbassiamo il minimo da 0.8 a 0.5)
         d_ax_raw = self.sigmoid(raw[:, self.n_iso + 3])
-        d_ax = (d_ax_raw * 2.2e-3) + 0.8e-3    
+        d_ax = (d_ax_raw * 2.5e-3) + 0.5e-3    
         
-        # D_rad: Must be low (e.g. < 0.8 um2/ms).
-        # Sigmoid (0-1) * 0.8 -> Range [0.0, 0.8]
+        # D_rad: [0.0 - 1.0] (Alziamo il massimo da 0.8 a 1.0 per fibre demielinizzate)
         d_rad_raw = self.sigmoid(raw[:, self.n_iso + 4])
-        d_rad = d_rad_raw * 0.8e-3
+        d_rad = d_rad_raw * 1.0e-3
 
-        # Safety Check: D_ax must always be > D_rad + margin
-        # This prevents the fiber from becoming a "ball" (isotropic)
-        d_ax = torch.max(d_ax, d_rad + 0.4e-3) 
+        # Safety Check: Gap ridotto da 0.4 a 0.15
+        # Ora basta una piccola anisotropia per essere classificati come fibra
+        d_ax = torch.max(d_ax, d_rad + 0.15e-3) 
 
         return torch.cat([
             f_iso, 
@@ -146,7 +127,7 @@ class DBSI_DeepSolver:
     Self-Supervised Solver with Denoising Regularization.
     """
     def __init__(self, 
-                 n_iso_bases: int = 20,  # Keep low (20) to avoid overfitting
+                 n_iso_bases: int = 20,
                  epochs: int = 150,      
                  batch_size: int = 2048, 
                  learning_rate: float = 1e-3,
@@ -161,13 +142,12 @@ class DBSI_DeepSolver:
     def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
         
         print(f"[DeepSolver] Starting training on device: {DEVICE}")
-        print(f"[DeepSolver] Constraints: D_ax [0.8-3.0], D_rad [0.0-0.8], Gap > 0.4")
+        print(f"[DeepSolver] Constraints: Relaxed (Gap > 0.15)")
         
         # 1. Data Preparation
         X_vol, Y_vol, Z_vol, N_meas = volume.shape
         valid_signals = volume[mask]
         
-        # Robust Normalization and Cleaning
         valid_signals = np.nan_to_num(valid_signals, nan=0.0, posinf=0.0, neginf=0.0)
         valid_signals = np.maximum(valid_signals, 0.0)
         
@@ -178,7 +158,6 @@ class DBSI_DeepSolver:
             valid_signals = valid_signals / s0
             valid_signals = np.clip(valid_signals, 0, 1.5)
         
-        # PyTorch Dataset
         dataset = TensorDataset(torch.tensor(valid_signals, dtype=torch.float32))
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         
@@ -208,17 +187,15 @@ class DBSI_DeepSolver:
             for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False, file=sys.stdout):
                 clean_signal = batch[0].to(DEVICE)
                 
-                # Denoising
                 noise = torch.randn_like(clean_signal) * self.noise_level
                 noisy_input = clean_signal + noise
                 
                 optimizer.zero_grad()
                 
-                # Forward
                 params_pred = encoder(noisy_input)
                 signal_recon = decoder(params_pred)
                 
-                # Loss: Only Reconstruction (NO Sparsity bias)
+                # Loss: SOLO Ricostruzione (Nessuna Sparsity Loss)
                 loss = loss_fn(signal_recon, clean_signal)
                 
                 loss.backward()
