@@ -10,7 +10,7 @@ try:
     from dipy.io.image import load_nifti
     from dipy.io import read_bvals_bvecs
     from dipy.core.gradients import gradient_table, GradientTable
-except ImportError:
+except (ImportError, AttributeError):
     print("WARNING: DIPY not found. Some utility functions may not work.")
     print("Install with: pip install dipy")
     
@@ -22,8 +22,8 @@ def load_dwi_data_dipy(
     f_nifti: str, 
     f_bval: str, 
     f_bvec: str, 
-    f_mask: Optional[str] = None
-) -> Tuple[np.ndarray, np.ndarray, GradientTable, Optional[np.ndarray]]:
+    f_mask: str 
+) -> Tuple[np.ndarray, np.ndarray, 'GradientTable', Optional[np.ndarray]]: # type: ignore
     """
     Loads DWI data, bvals, bvecs, and an optional mask using DIPY.
     
@@ -45,7 +45,9 @@ def load_dwi_data_dipy(
     
     print(f"[Utils] Loading bvals/bvecs from: {f_bval}, {f_bvec}")
     bvals, bvecs = read_bvals_bvecs(f_bval, f_bvec)
-    gtab = gradient_table(bvals, bvecs)
+    
+    # FIX: Passare 'bvecs' come keyword argument per evitare il Warning
+    gtab = gradient_table(bvals, bvecs=bvecs)
     
     print(f"  ✓ Volume: {data.shape}, Bvals: {len(gtab.bvals)}, Bvecs: {gtab.bvecs.shape}")
     print(f"  ✓ No. of b=0 volumes: {np.sum(gtab.b0s_mask)}")
