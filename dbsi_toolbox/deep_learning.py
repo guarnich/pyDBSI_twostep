@@ -34,7 +34,7 @@ class DBSI_PhysicsDecoder(nn.Module):
         d_ax          = params[:, self.n_iso + 3]
         d_rad         = params[:, self.n_iso + 4]
 
-        # Anisotropic
+        # Anisotropic Signal
         fiber_dir = torch.stack([
             torch.sin(theta) * torch.cos(phi),
             torch.sin(theta) * torch.sin(phi),
@@ -44,7 +44,7 @@ class DBSI_PhysicsDecoder(nn.Module):
         d_app_fiber = d_rad.unsqueeze(1) + (d_ax.unsqueeze(1) - d_rad.unsqueeze(1)) * (cos_angle ** 2)
         signal_fiber = f_fiber.unsqueeze(1) * torch.exp(-self.bvals.unsqueeze(0) * d_app_fiber)
 
-        # Isotropic
+        # Isotropic Signal
         basis_iso = torch.exp(-torch.ger(self.bvals, self.iso_diffusivities))
         signal_iso = torch.matmul(f_iso_weights, basis_iso.T)
 
@@ -53,15 +53,15 @@ class DBSI_PhysicsDecoder(nn.Module):
 
 class DBSI_RegularizedMLP(nn.Module):
     """
-    Macro-Compartment Architecture with Tighter Physical Constraints.
-    Forces the Fiber to look like a Fiber (thin), preventing it from 
-    cannibalizing the Hindered compartment.
+    Flat Competition Architecture.
+    All 4 compartments (Res, Hin, Wat, Fib) compete in a single Softmax layer.
+    This prevents the Fiber from dominating the Hindered fraction.
     """
-    def __init__(self, n_input_meas: int, n_iso_bases: int = 20, dropout_rate: float = 0.1):
+    def __init__(self, n_input_meas: int, n_iso_bases: int = 20, dropout_rate: float = 0.05):
         super().__init__()
         self.n_iso = n_iso_bases
         
-        # Masks for spectral aggregation
+        # Define masks
         grid = np.linspace(0, 3.0e-3, n_iso_bases)
         self.idx_res = torch.tensor(np.where(grid <= 0.3e-3)[0], dtype=torch.long)
         self.idx_hin = torch.tensor(np.where((grid > 0.3e-3) & (grid <= 2.0e-3))[0], dtype=torch.long)
@@ -77,77 +77,76 @@ class DBSI_RegularizedMLP(nn.Module):
             nn.LayerNorm(128), nn.ELU()
         )
         
-        # Heads
-        self.head_fiber = nn.Linear(128, 1)       # Fiber Fraction
-        self.head_iso_macro = nn.Linear(128, 3)   # [Res, Hin, Wat] prob
-        self.head_iso_micro = nn.Linear(128, n_iso_bases) # Shape
-        self.head_geom = nn.Linear(128, 4)        # [Theta, Phi, Dax, Drad]
+        # --- HEAD 1: Global Fractions (4 neurons: Res, Hin, Wat, Fib) ---
+        # COMPETITION HAPPENS HERE
+        self.head_fractions = nn.Linear(128, 4)
+        
+        # --- HEAD 2: Isotropic Micro Shapes ---
+        self.head_iso_micro = nn.Linear(128, n_iso_bases)
+        
+        # --- HEAD 3: Geometry ---
+        self.head_geom = nn.Linear(128, 4)
         
         self.sigmoid = nn.Sigmoid()
         self.softmax = nn.Softmax(dim=1)
         
-        # --- SMART INITIALIZATION ---
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize Linear layers standardly
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
         
-        # CUSTOM BIAS:
-        # 1. Fiber: Start neutral (not negative anymore to avoid zeros)
-        self.head_fiber.bias.data.fill_(0.0) 
-        
-        # 2. Macro Iso: Force network to look for HINDERED initially.
-        # [Res, Hin, Wat] -> Bias [0, +1.0, 0] makes Hindered slightly preferred at start
+        # Bias Initialization to guide convergence
+        # [Res, Hin, Wat, Fib]
+        # Start with Hindered slightly favored, Fiber neutral
         with torch.no_grad():
-            self.head_iso_macro.bias[1] = 1.0 
+            self.head_fractions.bias[1] = 0.5  # Boost Hindered start
+            self.head_fractions.bias[3] = -0.5 # Slight penalty on Fiber start
 
     def forward(self, x):
         feat = self.backbone(x)
         
-        # 1. Fiber Fraction
-        f_fiber = self.sigmoid(self.head_fiber(feat)).squeeze(1)
+        # 1. Global Competition (Sum = 1)
+        # probs: [p_res, p_hin, p_wat, p_fib]
+        probs = self.softmax(self.head_fractions(feat))
         
-        # 2. Isotropic Macro Probs
-        iso_macro_probs = self.softmax(self.head_iso_macro(feat))
+        f_res_macro = probs[:, 0:1]
+        f_hin_macro = probs[:, 1:2]
+        f_wat_macro = probs[:, 2:3]
+        f_fiber     = probs[:, 3] # This is the final fiber fraction
         
-        f_iso_total = 1.0 - f_fiber
-        
-        # 3. Micro Shapes
+        # 2. Isotropic Micro Shapes (Softmax within bands)
         micro_logits = self.head_iso_micro(feat)
         
-        # Restricted (Cell)
+        # Restricted Shape
         res_dist = self.softmax(micro_logits[:, self.idx_res])
-        w_res = res_dist * iso_macro_probs[:, 0:1] * f_iso_total.unsqueeze(1)
+        w_res = res_dist * f_res_macro
         
-        # Hindered (Edema)
+        # Hindered Shape
         hin_dist = self.softmax(micro_logits[:, self.idx_hin])
-        w_hin = hin_dist * iso_macro_probs[:, 1:2] * f_iso_total.unsqueeze(1)
+        w_hin = hin_dist * f_hin_macro
         
-        # Water (CSF)
+        # Water Shape
         wat_dist = self.softmax(micro_logits[:, self.idx_wat])
-        w_wat = wat_dist * iso_macro_probs[:, 2:3] * f_iso_total.unsqueeze(1)
+        w_wat = wat_dist * f_wat_macro
         
-        # Concat
+        # Combine
         f_iso_weights = torch.cat([w_res, w_hin, w_wat], dim=1)
         
-        # 4. Geometry with TIGHTER CONSTRAINTS
+        # 3. Geometry with STRICT Constraints
         geom = self.head_geom(feat)
         theta = self.sigmoid(geom[:, 0]) * np.pi
         phi   = (self.sigmoid(geom[:, 1]) - 0.5) * 2 * np.pi
         
-        # FIX: Tighter constraints to force separation
-        # D_ax: Min 1.0 (Fibers are fast axially)
-        d_ax  = self.sigmoid(geom[:, 2]) * 2.0e-3 + 1.0e-3  # Range [1.0, 3.0]
+        # D_AX: Must be > 1.2 to be a valid fiber (Hindered max is 2.0, but usually < 1.5)
+        d_ax  = self.sigmoid(geom[:, 2]) * 1.8e-3 + 1.2e-3  # Range [1.2, 3.0]
         
-        # D_rad: Max 0.8 (Fibers are thin). 
-        # If radial > 0.8, it MUST be modeled as Hindered Isotropic, not Fiber.
-        d_rad = self.sigmoid(geom[:, 3]) * 0.8e-3           # Range [0.0, 0.8]
+        # D_RAD: Must be VERY low (< 0.5). If it's higher, it's Hindered, not Fiber.
+        # This forces the network to use Hindered Fraction for fat isotropic blobs.
+        d_rad = self.sigmoid(geom[:, 3]) * 0.5e-3           # Range [0.0, 0.5]
         
-        # Logic constraint
         d_ax  = torch.max(d_ax, d_rad + 1e-6)
 
         return torch.cat([
@@ -160,7 +159,7 @@ class DBSI_RegularizedMLP(nn.Module):
         ], dim=1)
 
 class DBSI_DeepSolver:
-    def __init__(self, n_iso_bases: int = 20, epochs: int = 300, batch_size: int = 2048, learning_rate: float = 1e-3, noise_injection_level: float = 0.03):
+    def __init__(self, n_iso_bases: int = 20, epochs: int = 500, batch_size: int = 4096, learning_rate: float = 5e-4, noise_injection_level: float = 0.03):
         self.n_iso_bases = n_iso_bases
         self.epochs = epochs
         self.batch_size = batch_size
@@ -168,9 +167,8 @@ class DBSI_DeepSolver:
         self.noise_level = noise_injection_level
         
     def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
-        print(f"[DeepSolver] Strategy: Grouped Architecture + L2 Ridge Regularization")
+        print(f"[DeepSolver] Strategy: Flat 4-Way Competition + Strict Physics Constraints")
         
-        # Data Prep
         X_vol, Y_vol, Z_vol, N_meas = volume.shape
         valid_signals = volume[mask]
         
@@ -184,21 +182,20 @@ class DBSI_DeepSolver:
         dataset = TensorDataset(torch.tensor(valid_signals, dtype=torch.float32))
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
         
-        # Models
         encoder = DBSI_RegularizedMLP(N_meas, self.n_iso_bases).to(DEVICE)
         decoder = DBSI_PhysicsDecoder(bvals, bvecs, self.n_iso_bases).to(DEVICE)
         optimizer = optim.AdamW(encoder.parameters(), lr=self.lr)
         loss_mse = nn.MSELoss()
         
-        # Training
         encoder.train()
         current_noise = self.noise_level
         pbar = tqdm(range(self.epochs), desc="DL Optimization", unit="epoch", file=sys.stdout)
         
         for epoch in pbar:
             batch_loss = 0.0
-            if epoch > self.epochs // 2: current_noise = self.noise_level * 0.5
-            if epoch > self.epochs * 0.8: current_noise = 0.0
+            # Slower noise decay to keep regularization active longer
+            if epoch > 300: current_noise = self.noise_level * 0.5
+            if epoch > 450: current_noise = 0.0
             
             for batch in dataloader:
                 clean = batch[0].to(DEVICE)
@@ -207,18 +204,19 @@ class DBSI_DeepSolver:
                 optimizer.zero_grad()
                 preds = encoder(clean + noise)
                 
-                # Reconstruction Loss
+                # Reconstruction
                 recon = decoder(preds)
                 l_fit = loss_mse(recon, clean)
                 
-                # L2 Regularization on Spectrum (Ridge)
-                # Instead of forcing zeros (L1/Entropy), we force "smoothness" (L2).
-                # This prevents the network from zeroing out Restricted/Water 
-                # just because Hindered is dominant.
-                iso_weights = preds[:, :self.n_iso_bases]
-                l_reg = torch.mean(iso_weights ** 2)
+                # L2 Regularization on EVERYTHING to encourage sharing
+                # Penalizing squared fractions discourages any single fraction from going to 1.0
+                # This promotes co-existence of Fiber and Hindered.
+                # fractions are the macro probs (implicit in the structure, but we can approximate)
+                # We use weights directly.
+                all_weights = preds[:, :self.n_iso_bases+1] # Iso + Fiber
+                l_reg = torch.mean(all_weights ** 2)
                 
-                loss = l_fit + (0.01 * l_reg) # 0.01 weight for L2
+                loss = l_fit + (0.005 * l_reg) 
                 
                 loss.backward()
                 optimizer.step()
@@ -226,7 +224,6 @@ class DBSI_DeepSolver:
             
             pbar.set_postfix({"MSE": f"{batch_loss/len(dataloader):.6f}"})
             
-        # Inference
         print("Inference...")
         encoder.eval()
         full_loader = DataLoader(dataset, batch_size=4096, shuffle=False)
