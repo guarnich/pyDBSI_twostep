@@ -46,8 +46,9 @@ class DBSI_PhysicsDecoder(nn.Module):
 
 class DBSI_RegularizedMLP(nn.Module):
     """
-    Final Tuned Architecture.
-    Relaxed constraints on Fiber Radial Diffusivity to allow fiber recovery.
+    Final Tuned Architecture (Fiber Boost).
+    Relaxed constraints on Fiber Radial Diffusivity (up to 1.2) 
+    and Positive Bias for Fiber Fraction.
     """
     def __init__(self, n_input_meas: int, n_iso_bases: int = 20, dropout_rate: float = 0.05):
         super().__init__()
@@ -82,12 +83,14 @@ class DBSI_RegularizedMLP(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
         
-        # TUNING: Adjusted Biases
+        # TUNING: Fiber Boost
         # [Res, Hin, Wat, Fib]
         with torch.no_grad():
-            self.head_fractions.bias[1] = 0.5  # Keep aiding Hindered slightly
-            self.head_fractions.bias[3] = 0.2  # Fiber: Neutral/Positive (Was -0.5)
-            # This helps Fiber fight back against the others
+            self.head_fractions.bias[0] = 0.0  # Restricted: Neutral
+            self.head_fractions.bias[1] = 0.0  # Hindered: Neutral (was +0.5, removing help)
+            self.head_fractions.bias[2] = 0.0  # Water: Neutral
+            self.head_fractions.bias[3] = 0.5  # Fiber: POSITIVE BOOST (+0.5)
+            # This forces the network to prioritize Fiber fitting initially.
 
     def forward(self, x):
         feat = self.backbone(x)
@@ -116,13 +119,13 @@ class DBSI_RegularizedMLP(nn.Module):
         phi   = (self.sigmoid(geom[:, 1]) - 0.5) * 2 * np.pi
         
         # TUNING: Diffusivity Constraints
-        # D_AX: [1.0, 3.0] (Unchanged, good for separating from Restricted)
+        # D_AX: [1.0, 3.0]
         d_ax  = self.sigmoid(geom[:, 2]) * 2.0e-3 + 1.0e-3 
         
-        # D_RAD: [0.0, 0.9] (Relaxed from 0.5)
-        # Allowing up to 0.9 allows "fatter" fibers to be recognized as fibers
-        # instead of being dumped into Hindered/Water.
-        d_rad = self.sigmoid(geom[:, 3]) * 0.9e-3           
+        # D_RAD: [0.0, 1.2] (Relaxed from 0.9)
+        # We allow fibers to be slightly "fatter" (up to 1.2) so they aren't
+        # misclassified as Hindered/Water.
+        d_rad = self.sigmoid(geom[:, 3]) * 1.2e-3           
         
         d_ax  = torch.max(d_ax, d_rad + 1e-6)
 
@@ -136,7 +139,7 @@ class DBSI_RegularizedMLP(nn.Module):
         ], dim=1)
 
 class DBSI_DeepSolver:
-    def __init__(self, n_iso_bases: int = 20, epochs: int = 500, batch_size: int = 4096, learning_rate: float = 5e-4, noise_injection_level: float = 0.03):
+    def __init__(self, n_iso_bases: int = 20, epochs: int = 500, batch_size: int = 4096, learning_rate: float = 1e-3, noise_injection_level: float = 0.03):
         self.n_iso_bases = n_iso_bases
         self.epochs = epochs
         self.batch_size = batch_size
@@ -144,7 +147,7 @@ class DBSI_DeepSolver:
         self.noise_level = noise_injection_level
         
     def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
-        print(f"[DeepSolver] Strategy: Tuned Flat Competition (Relaxed D_rad + Neutral Fiber Bias)")
+        print(f"[DeepSolver] Strategy: Fiber Boost (+Bias, Relaxed Drad) + L2 Regularization")
         
         X_vol, Y_vol, Z_vol, N_meas = volume.shape
         valid_signals = volume[mask]
@@ -183,6 +186,7 @@ class DBSI_DeepSolver:
                 recon = decoder(preds)
                 l_fit = loss_mse(recon, clean)
                 
+                # L2 Regularization
                 all_weights = preds[:, :self.n_iso_bases+1]
                 l_reg = torch.mean(all_weights ** 2)
                 
