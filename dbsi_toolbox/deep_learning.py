@@ -81,10 +81,11 @@ class DBSI_RegularizedMLP(nn.Module):
         
         # Outputs:
         # 1 for Fiber Fraction (Sigmoid)
-        # n_iso for Isotropic Distribution (Softmax)
+        # n_iso_bases for Isotropic Distribution (Softmax)
         # 2 for Angles
         # 2 for Diffusivities
-        self.n_output_features = 1 + n_iso + 2 + 2 
+        # FIX: 'n_iso' was typo, changed to 'n_iso_bases'
+        self.n_output_features = 1 + n_iso_bases + 2 + 2 
         
         # Deeper/Wider network to capture subtle features
         self.net = nn.Sequential(
@@ -122,6 +123,7 @@ class DBSI_RegularizedMLP(nn.Module):
         f_fiber = self.sigmoid(f_fiber_raw)
         
         # 2. Calculate Isotropic Distribution (Sums to 1)
+        # FIX: Use self.n_iso correctly for slicing
         iso_logits = raw[:, 1:self.n_iso + 1]
         iso_dist = self.softmax_iso(iso_logits)
         
