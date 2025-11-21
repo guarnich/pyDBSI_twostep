@@ -70,7 +70,7 @@ def load_dwi_data_dipy(
 
 def estimate_snr(
     data: np.ndarray, 
-    gtab: 'GradientTable', 
+    gtab: 'GradientTable', #type: ignore
     mask: Optional[np.ndarray] = None
 ) -> float:
     """
