@@ -92,8 +92,8 @@ def estimate_snr(
             snr_est = np.median(snr_map[mask])
             print(f"  ✓ Median Temporal SNR (Brain): {snr_est:.2f}")
         else:
-            print("  ! Mask is empty. Defaulting to 30.0")
-            snr_est = 30.0
+            print("  ! Mask is empty. Defaulting to 20.0")
+            snr_est = 20.0
 
     # --- FALLBACK (Single b0) ---
     else:
