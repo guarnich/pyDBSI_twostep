@@ -46,7 +46,7 @@ def load_dwi_data_dipy(
     print(f"[Utils] Loading bvals/bvecs from: {f_bval}, {f_bvec}")
     bvals, bvecs = read_bvals_bvecs(f_bval, f_bvec)
     
-    # FIX: Passare 'bvecs' come keyword argument per evitare il Warning
+    # Pass 'bvecs' as keyword argument to avoid Warning
     gtab = gradient_table(bvals, bvecs=bvecs)
     
     print(f"  ✓ Volume: {data.shape}, Bvals: {len(gtab.bvals)}, Bvecs: {gtab.bvecs.shape}")
@@ -74,101 +74,100 @@ def estimate_snr(
     mask: Optional[np.ndarray] = None
 ) -> float:
     """
-    Stima l'SNR (Signal-to-Noise Ratio) usando le immagini b=0.
+    Estimates SNR (Signal-to-Noise Ratio) using b=0 images.
     
-    Strategia:
-    1. Se ci sono >= 3 volumi b=0: Usa il metodo 'temporale' (Media/Std voxel-wise).
-    2. Se ci sono < 3 volumi b=0: Usa il metodo 'spaziale' (Segnale ROI / Rumore Background).
+    Strategy:
+    1. If >= 3 b=0 volumes: Use 'temporal' method (Voxel-wise Mean/Std).
+    2. If < 3 b=0 volumes: Use 'spatial' method (Signal ROI / Background Noise).
     
     Args:
-        data: Volume 4D DWI (X, Y, Z, N)
-        gtab: GradientTable di DIPY
-        mask: Maschera binaria 3D del cervello (opzionale, ma raccomandata)
+        data: 4D DWI volume (X, Y, Z, N)
+        gtab: DIPY GradientTable
+        mask: 3D binary mask of the brain (optional but recommended)
         
     Returns:
-        float: Stima dell'SNR.
+        float: Estimated SNR.
     """
-    print("\n[Utils] Stima automatica SNR in corso...")
+    print("\n[Utils] Automatically estimating SNR...")
     
-    # 1. Estrai i volumi b=0
+    # 1. Extract b=0 volumes
     b0_mask = gtab.b0s_mask
     b0_data = data[..., b0_mask]
     n_b0 = b0_data.shape[-1]
     
     if n_b0 == 0:
-        print("  ! ATTENZIONE: Nessun volume b=0 trovato. Ritorno SNR default = 30.0")
+        print("  ! WARNING: No b=0 volumes found. Returning default SNR = 30.0")
         return 30.0
 
-    # 2. Gestione Maschera (se non fornita, creane una semplice basata sull'intensità)
+    # 2. Handle Mask (if not provided, create simple intensity-based mask)
     if mask is None:
-        print("  ! Maschera non fornita. Calcolo maschera base (Otsu thresholding)...")
+        print("  ! Mask not provided. Calculating basic mask (Otsu thresholding)...")
         from dipy.segment.mask import median_otsu
-        # Usa il primo b0 per creare la maschera
+        # Use the first b0 to create the mask
         _, mask = median_otsu(b0_data[..., 0], median_radius=2, numpass=1)
 
-    # Assicurati che la maschera sia booleana
+    # Ensure mask is boolean
     mask = mask.astype(bool)
     if np.sum(mask) == 0:
-        print("  ! Maschera vuota. Impossibile calcolare SNR. Ritorno default = 30.0")
+        print("  ! Empty mask. Cannot calculate SNR. Returning default = 30.0")
         return 30.0
 
     snr_est = 0.0
 
-    # --- METODO 1: SNR Temporale (se abbiamo abbastanza b0) ---
+    # --- METHOD 1: Temporal SNR (if enough b0s) ---
     if n_b0 >= 3:
-        print(f"  ✓ Metodo: Temporale (basato su {n_b0} volumi b=0)")
-        # Calcola media e std lungo la dimensione temporale (4a dimensione)
+        print(f"  ✓ Method: Temporal (based on {n_b0} b=0 volumes)")
+        # Calculate mean and std along the temporal dimension (4th dim)
         mean_b0 = np.mean(b0_data, axis=-1)
         std_b0 = np.std(b0_data, axis=-1)
         
-        # Evita divisioni per zero
+        # Avoid division by zero
         std_b0[std_b0 == 0] = 1e-10
         
-        # SNR voxel-wise
+        # Voxel-wise SNR
         snr_map = mean_b0 / std_b0
         
-        # Prendi la mediana dell'SNR solo all'interno del cervello
+        # Take median SNR only inside the brain mask
         snr_est = np.median(snr_map[mask])
-        print(f"  ✓ SNR calcolato (Mediana voxel-wise): {snr_est:.2f}")
+        print(f"  ✓ Calculated SNR (Voxel-wise Median): {snr_est:.2f}")
 
-    # --- METODO 2: SNR Spaziale (Segnale/Background) ---
+    # --- METHOD 2: Spatial SNR (Signal/Background) ---
     else:
-        print(f"  ✓ Metodo: Spaziale (pochi b0 disponibili: {n_b0})")
-        # Usa la media di tutti i b0 disponibili per ridurre il rumore visuale
+        print(f"  ✓ Method: Spatial (few b0s available: {n_b0})")
+        # Use mean of all available b0s to reduce visual noise
         mean_b0 = np.mean(b0_data, axis=-1)
         
-        # Segnale: Media intensità dentro la maschera
+        # Signal: Mean intensity inside the mask
         signal_mean = np.mean(mean_b0[mask])
         
-        # Rumore: Deviazione standard fuori dalla maschera (Background)
-        # Per sicurezza, prendiamo solo gli angoli o i bordi estremi per evitare ghosting
-        # Ma per semplicità qui usiamo l'inverso della maschera
+        # Noise: Standard deviation outside the mask (Background)
+        # For simplicity, using the inverse of the mask
         background_mask = ~mask
         
-        # Rimuoviamo eventuali artefatti zero/NaN
+        # Remove artifacts (zero/NaN)
         noise_data = mean_b0[background_mask]
         noise_data = noise_data[noise_data > 0] 
         
         if len(noise_data) == 0:
-             print("  ! Impossibile trovare rumore di fondo valido. Ritorno default = 30.0")
+             print("  ! Unable to find valid background noise. Returning default = 30.0")
              return 30.0
              
         noise_std = np.std(noise_data)
         
-        # Correzione per rumore Rician/Rayleigh nelle immagini magnitudo (background)
-        # SD_reale = SD_background / 0.655
+        # Correction for Rician/Rayleigh noise in magnitude images (background)
+        # Real_SD = Background_SD / 0.655
         noise_std_corrected = noise_std / 0.655
         
         snr_est = signal_mean / noise_std_corrected
-        print(f"  ✓ Segnale medio: {signal_mean:.2f}, Rumore std (corr): {noise_std_corrected:.2f}")
-        print(f"  ✓ SNR calcolato: {snr_est:.2f}")
+        print(f"  ✓ Mean Signal: {signal_mean:.2f}, Noise Std (corr): {noise_std_corrected:.2f}")
+        print(f"  ✓ Calculated SNR: {snr_est:.2f}")
 
-    # Limiti di sicurezza (Sanity Check)
+    # Safety limits (Sanity Check)
     if snr_est < 5.0:
-        print("  ! SNR molto basso rilevato (<5). Potrebbe essere un errore. Clamp a 5.0.")
+        print("  ! Very low SNR detected (<5). Might be an error. Clamping to 5.0.")
         snr_est = 5.0
     elif snr_est > 100.0:
-        print("  ! SNR molto alto rilevato (>100). Possibile maschera errata o dati sintetici. Clamp a 100.0.")
+        print("  ! Very high SNR detected (>100). Possible bad mask or synthetic data. Clamping to 100.0.")
         snr_est = 100.0
         
     return float(snr_est)
@@ -181,8 +180,7 @@ def save_parameter_maps(
     prefix: str = 'dbsi'
 ):
     """
-    Saves parameter maps as NIfTI files
-    (Function from your FULL MODEL script)
+    Saves parameter maps as NIfTI files.
     
     Args:
         param_maps: Dictionary with the parameter maps

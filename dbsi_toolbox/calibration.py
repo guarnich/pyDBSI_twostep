@@ -14,7 +14,7 @@ def generate_synthetic_signal_rician(
 ) -> np.ndarray:
     """
     Generates a synthetic diffusion signal with Rician noise distribution.
-    Physiological parameters are based on Wang et al., 2011.
+    Physiological parameters are based on Wang et al., 2011. 
     """
     # 1. Standard physiological parameters
     D_fiber_ax = 1.5e-3
@@ -59,7 +59,8 @@ def optimize_dbsi_params(
     bases_grid: List[int] = [25, 50, 75],
     lambdas_grid: List[float] = [0.01, 0.1, 0.5],
     ground_truth: Dict[str, float] = {'f_fiber': 0.5, 'f_cell': 0.3, 'f_water': 0.2},
-    verbose: bool = True
+    verbose: bool = True,
+    seed: Optional[int] = 42
 ) -> Dict:
     """
     Performs a Monte Carlo calibration to identify the optimal DBSI hyperparameters
@@ -74,11 +75,18 @@ def optimize_dbsi_params(
         lambdas_grid: List of regularization weights to test.
         ground_truth: Dictionary containing "true" fractions for the phantom.
         verbose: If True, prints progress to stdout.
+        seed: Integer to seed the random number generator for reproducibility (default: 42).
         
     Returns:
         A dictionary containing the optimal parameters ('n_bases', 'reg_lambda') 
         and error statistics.
     """
+    
+    # Set seed for reproducibility
+    if seed is not None:
+        if verbose:
+            print(f"[Calibration] Setting random seed to {seed} for reproducibility.")
+        np.random.seed(seed)
     
     if verbose:
         print(f"\n[Calibration] Starting protocol optimization ({len(real_bvals)} volumes).")
@@ -120,6 +128,7 @@ def optimize_dbsi_params(
             # Monte Carlo Simulation Loop
             for _ in range(n_monte_carlo):
                 # Generate fresh signal with new noise instance
+                # (Since seed is set, this sequence will be identical across runs)
                 sig = generate_synthetic_signal_rician(
                     flat_bvals, clean_bvecs,
                     ground_truth['f_fiber'], ground_truth['f_cell'], ground_truth['f_water'],
