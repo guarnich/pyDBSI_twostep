@@ -3,142 +3,205 @@
 import os
 import numpy as np
 import nibabel as nib
-from typing import Tuple
-from scipy.ndimage import binary_erosion # Usato solo per pulire il background
+from typing import Tuple, Optional
 
-# Import DIPY functions
+# Import DIPY functions for compatibility
 try:
     from dipy.io.image import load_nifti
     from dipy.io import read_bvals_bvecs
-    from dipy.core.gradients import gradient_table, GradientTable
-    from dipy.segment.mask import median_otsu
+    from dipy.core.gradients import gradient_table, GradientTable # type: ignore
 except (ImportError, AttributeError):
     print("WARNING: DIPY not found. Some utility functions may not work.")
+    print("Install with: pip install dipy")
+    
+    # Create a dummy type to avoid import errors if dipy isn't present
     GradientTable = type("GradientTable", (object,), {})
+
 
 def load_dwi_data_dipy(
     f_nifti: str, 
     f_bval: str, 
     f_bvec: str, 
     f_mask: str 
-) -> Tuple[np.ndarray, np.ndarray, 'GradientTable', np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, 'GradientTable', Optional[np.ndarray]]: # type: ignore
     """
-    Loads DWI data, bvals, bvecs, and the MANDATORY brain mask.
+    Loads DWI data, bvals, bvecs, and an optional mask using DIPY.
+    
+    Args:
+        f_nifti: Path to the 4D NIfTI file (.nii or .nii.gz)
+        f_bval: Path to the .bval file
+        f_bvec: Path to the .bvec file
+        f_mask: Optional path to the 3D NIfTI mask file
+        
+    Returns:
+        A tuple containing:
+        - data (np.ndarray): 4D DWI data
+        - affine (np.ndarray): Affine matrix
+        - gtab (GradientTable): DIPY gradient table object
+        - mask (np.ndarray | None): 3D boolean mask or None
     """
-    # --- STRICT INPUT CHECK ---
-    if not f_mask:
-        raise ValueError("\n[CRITICAL] Brain Mask is MISSING. Please provide it.")
-
     print(f"[Utils] Loading data from: {f_nifti}")
     data, affine = load_nifti(f_nifti)
     
-    print(f"[Utils] Loading bvals/bvecs...")
+    print(f"[Utils] Loading bvals/bvecs from: {f_bval}, {f_bvec}")
     bvals, bvecs = read_bvals_bvecs(f_bval, f_bvec)
+    
+    # Pass 'bvecs' as keyword argument to avoid Warning
     gtab = gradient_table(bvals, bvecs=bvecs)
     
-    print(f"[Utils] Loading mask...")
-    mask_data, _ = load_nifti(f_mask)
-    mask_data = mask_data.astype(bool)
+    print(f"  ✓ Volume: {data.shape}, Bvals: {len(gtab.bvals)}, Bvecs: {gtab.bvecs.shape}")
+    print(f"  ✓ No. of b=0 volumes: {np.sum(gtab.b0s_mask)}")
     
-    if mask_data.shape != data.shape[:3]:
-        raise ValueError(f"Mask shape {mask_data.shape} mismatch data {data.shape[:3]}")
+    mask_data = None
+    if f_mask:
+        print(f"[Utils] Loading mask from: {f_mask}")
+        mask_data, mask_affine = load_nifti(f_mask)
+        mask_data = mask_data.astype(bool)
+        
+        # Validation
+        if mask_data.shape != data.shape[:3]:
+            raise ValueError(
+                f"Mask shape {mask_data.shape} does not match "
+                f"data shape {data.shape[:3]}"
+            )
+        print(f"  ✓ Mask: {mask_data.shape}, Voxels: {np.sum(mask_data):,}")
+    else:
+        print("  ! No mask provided.")
     
     return data, affine, gtab, mask_data
 
+
 def estimate_snr(
     data: np.ndarray, 
-    gtab: 'GradientTable', 
-    affine: np.ndarray,
-    mask: np.ndarray
+    gtab: 'GradientTable', #type: ignore
+    mask: Optional[np.ndarray] = None
 ) -> float:
     """
-    Estimates SNR using a Robust & Simple approach.
+    Estimates SNR (Signal-to-Noise Ratio) using b=0 images.
     
-    Method 1 (Temporal): If >= 3 b0s, uses voxel-wise temporal stability.
-    Method 2 (Spatial): Uses Median(Brain) / Std(Background_Air).
+    Strategy:
+    1. If >= 3 b=0 volumes: Use 'temporal' method (Voxel-wise Mean/Std).
+    2. If < 3 b=0 volumes: Use 'spatial' method (Signal inside Mask / Noise outside Mask).
+    
+    Args:
+        data: 4D DWI volume (X, Y, Z, N)
+        gtab: DIPY GradientTable
+        mask: 3D binary mask of the brain (optional but recommended)
+        
+    Returns:
+        float: Estimated SNR.
     """
-    print("\n[Utils] Estimating SNR (Robust Method)...")
+    print("\n[Utils] Automatically estimating SNR...")
     
-    # 1. Extract b0 volumes
-    b0_data = data[..., gtab.b0s_mask]
+    # 1. Extract b=0 volumes
+    b0_mask = gtab.b0s_mask
+    b0_data = data[..., b0_mask]
     n_b0 = b0_data.shape[-1]
     
     if n_b0 == 0:
-        print("  ! No b=0 volumes. Defaulting to SNR=30.0")
+        print("  ! WARNING: No b=0 volumes found. Returning default SNR = 30.0")
+        return 30.0
+
+    # Ensure mask is boolean if present
+    if mask is not None:
+        mask = mask.astype(bool)
+        if np.sum(mask) == 0:
+            print("  ! Empty mask. Returning default SNR = 30.0")
+            return 30.0
+    else:
+        # Without mask, spatial SNR is impossible. Return default.
+        print("  ! No mask provided for SNR estimation. Returning default = 30.0")
         return 30.0
 
     snr_est = 0.0
 
-    # --- METHOD 1: TEMPORAL (Best if possible) ---
+    # --- METHOD 1: Temporal SNR (if enough b0s) ---
     if n_b0 >= 3:
-        print(f"  ✓ Method: Temporal ({n_b0} volumes)")
+        print(f"  ✓ Method: Temporal (based on {n_b0} b=0 volumes)")
+        # Calculate mean and std along the temporal dimension (4th dim)
         mean_b0 = np.mean(b0_data, axis=-1)
         std_b0 = np.std(b0_data, axis=-1)
+        
+        # Avoid division by zero
         std_b0[std_b0 == 0] = 1e-10
         
-        # SNR Map
+        # Voxel-wise SNR
         snr_map = mean_b0 / std_b0
         
-        # Robust Metric: Median SNR inside the Brain Mask
-        if np.sum(mask) > 0:
-            snr_est = np.median(snr_map[mask])
-            print(f"  ✓ Median Voxel-wise SNR: {snr_est:.2f}")
-        else:
-            snr_est = 30.0
+        # Take median SNR only inside the brain mask
+        snr_est = np.median(snr_map[mask])
+        print(f"  ✓ Calculated SNR (Voxel-wise Median): {snr_est:.2f}")
 
-    # --- METHOD 2: SPATIAL (Simple & Robust) ---
+    # --- METHOD 2: Spatial SNR (Signal/Background) ---
     else:
-        print(f"  ✓ Method: Spatial (Background Statistics)")
+        print(f"  ✓ Method: Spatial (few b0s available: {n_b0})")
+        # Use mean of all available b0s to reduce visual noise
         mean_b0 = np.mean(b0_data, axis=-1)
         
-        # A. SIGNAL: Median of the Brain (Robust to lesions/CSF)
-        if np.sum(mask) == 0:
-            return 30.0
-        signal_val = np.median(mean_b0[mask])
+        # Signal: Mean intensity inside the provided mask
+        signal_mean = np.mean(mean_b0[mask])
         
-        # B. NOISE: Automatic Background Detection (Intensity-based)
-        # Use Otsu to find a threshold that separates "Signal" (Head) from "Noise" (Air)
-        # We don't care about anatomy here, just intensity statistics.
-        otsu_thresh, _ = median_otsu(mean_b0, median_radius=2, numpass=1)
+        # Noise: Standard deviation of everything OUTSIDE the mask
+        background_mask = ~mask
         
-        # Define Background: Everything well below the signal threshold
-        # Using 0.5 * Otsu ensures we stay deep in the noise floor
-        noise_thresh = otsu_thresh * 0.5
-        background_mask = mean_b0 < noise_thresh
+        # Remove artifacts (true zeros from padding)
+        noise_data = mean_b0[background_mask]
+        noise_data = noise_data[noise_data > 0] 
         
-        # Optional: Erode background to stay away from scalp edges/ghosting
-        background_mask = binary_erosion(background_mask, iterations=1)
+        if len(noise_data) == 0:
+             print("  ! Unable to find valid background noise. Returning default = 30.0")
+             return 30.0
+             
+        noise_std = np.std(noise_data)
         
-        # Calculate Noise Std
-        noise_vals = mean_b0[background_mask]
-        if len(noise_vals) > 100:
-            noise_std = np.std(noise_vals)
-            # Rician Correction
-            noise_corr = noise_std / 0.655
-            
-            if noise_corr > 0:
-                snr_est = signal_val / noise_corr
-            else:
-                snr_est = 30.0
-        else:
-            print("  ! Not enough background voxels found.")
-            snr_est = 30.0
-            
-        print(f"  ✓ Signal (Median Brain): {signal_val:.2f}")
-        print(f"  ✓ Noise (Std Background): {noise_corr:.2f}")
-        print(f"  ✓ Estimated SNR: {snr_est:.2f}")
+        # Correction for Rician/Rayleigh noise in magnitude images
+        # Real_SD = Background_SD / 0.655
+        noise_std_corrected = noise_std / 0.655
+        
+        snr_est = signal_mean / noise_std_corrected
+        print(f"  ✓ Mean Signal (Inside Mask): {signal_mean:.2f}")
+        print(f"  ✓ Noise Std (Outside Mask, corr): {noise_std_corrected:.2f}")
+        print(f"  ✓ Calculated SNR: {snr_est:.2f}")
 
-    # Safety Clamping
-    snr_est = np.clip(snr_est, 5.0, 100.0)
+    # Safety limits (Sanity Check)
+    if snr_est < 5.0:
+        print("  ! Very low SNR detected (<5). Might be an error. Clamping to 5.0.")
+        snr_est = 5.0
+    elif snr_est > 100.0:
+        print("  ! Very high SNR detected (>100). Possible synthetic data. Clamping to 100.0.")
+        snr_est = 100.0
+        
     return float(snr_est)
 
-def save_parameter_maps(param_maps, affine, output_dir, prefix='dbsi'):
+
+def save_parameter_maps(
+    param_maps: dict, 
+    affine: np.ndarray, 
+    output_dir: str, 
+    prefix: str = 'dbsi'
+):
+    """
+    Saves parameter maps as NIfTI files.
+    
+    Args:
+        param_maps: Dictionary with the parameter maps
+        affine: Affine matrix from the original volume
+        output_dir: Output directory
+        prefix: Prefix for the output files
+    """
     os.makedirs(output_dir, exist_ok=True)
+    
+    saved_count = 0
     print(f"\n[Utils] Saving {len(param_maps)} maps to: {output_dir}")
-    for k, v in param_maps.items():
+    
+    for param_name, param_data in param_maps.items():
         try:
-            nib.save(nib.Nifti1Image(v.astype(np.float32), affine), 
-                     os.path.join(output_dir, f'{prefix}_{k}.nii.gz'))
+            # Ensure data is float32 for saving
+            img = nib.Nifti1Image(param_data.astype(np.float32), affine)
+            filename = os.path.join(output_dir, f'{prefix}_{param_name}.nii.gz')
+            nib.save(img, filename)
+            saved_count += 1
         except Exception as e:
-            print(f"  ! Error saving {k}: {e}")
-    print("  ✓ Done.")
+            print(f"  ! Error saving {param_name}: {e}")
+    
+    print(f"  ✓ Saved {saved_count} parameter maps.")
