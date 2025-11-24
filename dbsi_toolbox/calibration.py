@@ -54,10 +54,10 @@ def generate_synthetic_signal_rician(
 def optimize_dbsi_params(
     real_bvals: np.ndarray,
     real_bvecs: np.ndarray,
-    snr_estimate: float = 30.0,
-    n_monte_carlo: int = 500,
-    bases_grid: List[int] = [25, 50, 75],
-    lambdas_grid: List[float] = [0.01, 0.1, 0.5],
+    snr_estimate: float = 20.0,
+    n_monte_carlo: int = 1000,
+    bases_grid: List[int] = [25, 50, 75, 100],
+    lambdas_grid: List[float] = [0.01, 0.1, 0.25, 0.5],
     ground_truth: Dict[str, float] = {'f_fiber': 0.5, 'f_cell': 0.3, 'f_water': 0.2},
     verbose: bool = True,
     seed: Optional[int] = 42
