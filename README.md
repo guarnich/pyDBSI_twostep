@@ -105,8 +105,8 @@ python examples/run_dbsi.py --help
 | **B-Vectors** | `--bvec` | ✅ | Path to the `.bvec` file containing diffusion gradient directions. |
 | **Brain Mask** | `--mask` | ✅ | Path to the 3D binary brain mask NIfTI file. **Mandatory.** |
 | **Output Dir** | `--out` | ✅ | Directory where the resulting parameter maps and metadata will be saved. |
-| **SNR** | `--snr` | ❌ | Manually specify the Signal-to-Noise Ratio (float). If omitted, SNR is **automatically estimated** from the data. |
-| **MC Iterations** | `--mc_iter` | ❌ | Number of Monte Carlo iterations to perform during the hyperparameter calibration step. Default: `200`. |
+| **SNR** | `--snr` | ❌ | Manually specify the Signal-to-Noise Ratio (float). If omitted, SNR is **automatically estimated** from the data. Default: `20`.  |
+| **MC Iterations** | `--mc_iter` | ❌ | Number of Monte Carlo iterations to perform during the hyperparameter calibration step. Default: `1000`. |
 
 ```
 ```
