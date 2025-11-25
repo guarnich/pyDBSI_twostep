@@ -42,8 +42,8 @@ def parse_args():
     # Advanced Options
     parser.add_argument('--snr', type=float, default=None, 
                         help='Manual SNR override (if not specified, it is estimated from data)')
-    parser.add_argument('--mc_iter', type=int, default=200, 
-                        help='Monte Carlo iterations for calibration (default: 200)')
+    parser.add_argument('--mc_iter', type=int, default=1000, 
+                        help='Monte Carlo iterations for calibration (default: 1000)')
     
     return parser.parse_args()
 
