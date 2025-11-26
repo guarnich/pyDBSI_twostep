@@ -64,7 +64,7 @@ def fit_volume_numba(data_flat, bvals, A, reg_lambda, mask_flat, n_aniso, idx_re
     n_voxels, n_meas = data_flat.shape
     n_bases = A.shape[1]
     
-    # Pre-calcolo matrici
+    # Pre-calcolo matrici (Tikhonov regularization)
     AtA = np.dot(A.T, A)
     if reg_lambda > 0:
         for i in range(n_bases):
@@ -77,6 +77,8 @@ def fit_volume_numba(data_flat, bvals, A, reg_lambda, mask_flat, n_aniso, idx_re
             continue
             
         signal = data_flat[i, :]
+        
+        # Calcolo S0 robusto (media dei b<50)
         s0 = 0.0
         count_b0 = 0
         for k in range(n_meas):
@@ -99,6 +101,7 @@ def fit_volume_numba(data_flat, bvals, A, reg_lambda, mask_flat, n_aniso, idx_re
         f_hin = 0.0
         f_wat = 0.0
         
+        # Somma pesi
         for j in range(n_aniso):
             f_fiber += weights[j]
             
@@ -115,6 +118,6 @@ def fit_volume_numba(data_flat, bvals, A, reg_lambda, mask_flat, n_aniso, idx_re
             results[i, 1] = f_res / total_w
             results[i, 2] = f_hin / total_w
             results[i, 3] = f_wat / total_w
-        #results[i, 4] = 1.0 
+         
 
     return results
