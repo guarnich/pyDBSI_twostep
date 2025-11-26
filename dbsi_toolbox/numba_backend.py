@@ -4,6 +4,7 @@ from numba import njit, prange
 
 @njit(fastmath=True, cache=True)
 def build_design_matrix_numba(bvals, bvecs, iso_diffusivities, axial_diff, radial_diff):
+    """Costruisce la matrice di design A (N_misure x N_basi) in modo vettorializzato."""
     n_meas = len(bvals)
     n_aniso = len(bvecs)
     n_iso = len(iso_diffusivities)
@@ -35,6 +36,7 @@ def build_design_matrix_numba(bvals, bvecs, iso_diffusivities, axial_diff, radia
 
 @njit(fastmath=True, cache=True)
 def coordinate_descent_nnls(AtA, Aty, max_iter=300, tol=1e-7):
+    """Solver NNLS ottimizzato per matrici dense di piccole dimensioni."""
     n_vars = AtA.shape[0]
     x = np.zeros(n_vars, dtype=np.float64)
     
@@ -61,10 +63,11 @@ def coordinate_descent_nnls(AtA, Aty, max_iter=300, tol=1e-7):
 
 @njit(parallel=True, fastmath=True)
 def fit_volume_numba(data_flat, bvals, A, reg_lambda, mask_flat, n_aniso, idx_res_end, idx_hin_end):
+    """Esegue il fitting su tutto il volume in parallelo su CPU."""
     n_voxels, n_meas = data_flat.shape
     n_bases = A.shape[1]
     
-    # Pre-calcolo matrici (Tikhonov regularization)
+    # Pre-calcolo matrici (A^T * A) con regolarizzazione Tikhonov
     AtA = np.dot(A.T, A)
     if reg_lambda > 0:
         for i in range(n_bases):
@@ -78,7 +81,7 @@ def fit_volume_numba(data_flat, bvals, A, reg_lambda, mask_flat, n_aniso, idx_re
             
         signal = data_flat[i, :]
         
-        # Calcolo S0 robusto (media dei b<50)
+        # Normalizzazione S0 robusta
         s0 = 0.0
         count_b0 = 0
         for k in range(n_meas):
@@ -93,15 +96,16 @@ def fit_volume_numba(data_flat, bvals, A, reg_lambda, mask_flat, n_aniso, idx_re
         for k in range(n_meas):
             y[k] = signal[k] / s0
             
+        # Preparazione e Risoluzione NNLS
         Aty = np.dot(A.T, y)
         weights = coordinate_descent_nnls(AtA, Aty)
         
+        # Aggregazione Metriche
         f_fiber = 0.0
         f_res = 0.0
         f_hin = 0.0
         f_wat = 0.0
         
-        # Somma pesi
         for j in range(n_aniso):
             f_fiber += weights[j]
             
@@ -118,6 +122,6 @@ def fit_volume_numba(data_flat, bvals, A, reg_lambda, mask_flat, n_aniso, idx_re
             results[i, 1] = f_res / total_w
             results[i, 2] = f_hin / total_w
             results[i, 3] = f_wat / total_w
-         
+        
 
     return results

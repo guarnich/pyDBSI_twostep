@@ -1,9 +1,8 @@
 # dbsi_toolbox/spectrum_basis.py
-
 import numpy as np
 from .base import BaseDBSI
 from .common import DBSIParams
-from .numba_backend import build_design_matrix_numba, fit_volume_numba
+from .numba_backend import build_design_matrix_numba, fit_volume_numba, coordinate_descent_nnls
 
 class DBSI_BasisSpectrum(BaseDBSI):
     """
@@ -24,17 +23,14 @@ class DBSI_BasisSpectrum(BaseDBSI):
         self.reg_lambda = reg_lambda
         self.filter_threshold = filter_threshold
         self.design_matrix = None
+        self.current_bvecs = None
 
     def _build_design_matrix(self, bvals, bvecs):
-        """
-        Helper per costruire la matrice di design (usato per visualizzazione nel notebook).
-        """
+        """Metodo helper per costruire la matrice (usato anche dalla CLI/Jupyter)."""
         flat_bvals = np.array(bvals).flatten().astype(np.float64)
-        n_meas = len(flat_bvals)
         
-        # Standardize bvecs to (N, 3)
-        # Se arrivano come (3, N), li trasponiamo
-        if bvecs.shape == (3, n_meas):
+        # Standardizzazione bvecs a (N, 3)
+        if bvecs.shape == (3, len(flat_bvals)):
             current_bvecs = bvecs.T.astype(np.float64)
         else:
             current_bvecs = bvecs.astype(np.float64)
@@ -49,51 +45,48 @@ class DBSI_BasisSpectrum(BaseDBSI):
             self.radial_diff_basis
         )
 
-    def fit_volume(self, volume, bvals, bvecs, mask=None, **kwargs):
+    def fit_voxel(self, signal, bvals):
         """
-        Versione accelerata Numba del fitting volumetrico (standalone).
+        Fit singolo voxel (usato SOLO durante la calibrazione).
+        Usa Numba internamente per velocità anche sul singolo voxel.
         """
-        X, Y, Z, N = volume.shape
-        n_voxels = X * Y * Z
-        
-        # 1. Flattening dati
-        data_flat = volume.reshape(n_voxels, N).astype(np.float64)
-        mask_flat = mask.flatten().astype(bool) if mask is not None else np.ones(n_voxels, dtype=bool)
-        
-        flat_bvals = np.array(bvals).flatten().astype(np.float64)
-        if bvecs.shape == (3, N):
-            current_bvecs = bvecs.T.astype(np.float64)
-        else:
-            current_bvecs = bvecs.astype(np.float64)
-
-        # 2. Design Matrix
         if self.design_matrix is None:
-            self.design_matrix = self._build_design_matrix(flat_bvals, current_bvecs)
+            return self._get_empty_params()
+            
+        s0 = np.mean(signal[bvals < 50]) if np.any(bvals < 50) else signal[0]
+        if s0 <= 1e-6: return self._get_empty_params()
         
-        # 3. Indici per frazioni isotrope
+        y = (signal / s0).astype(np.float64)
+        
+        # Setup matrici per NNLS
+        A = self.design_matrix
+        AtA = np.dot(A.T, A)
+        if self.reg_lambda > 0:
+            # Aggiunta regolarizzazione sulla diagonale
+            for i in range(len(AtA)):
+                AtA[i, i] += self.reg_lambda
+                
+        Aty = np.dot(A.T, y)
+        
+        # Solve
+        weights = coordinate_descent_nnls(AtA, Aty)
+        
+        # Estrazione metriche (semplificata per calibrazione)
+        n_aniso = len(self.current_bvecs) if self.current_bvecs is not None else 0
         iso_diffs = np.linspace(self.iso_range[0], self.iso_range[1], self.n_iso_bases)
-        idx_res_end = np.sum(iso_diffs <= 0.3e-3)
-        idx_hin_end = np.sum(iso_diffs <= 2.0e-3)
-        n_aniso = len(current_bvecs)
-
-        # 4. Fit
-        raw_results = fit_volume_numba(
-            data_flat, 
-            flat_bvals, 
-            self.design_matrix, 
-            self.reg_lambda, 
-            mask_flat,
-            n_aniso,
-            idx_res_end,
-            idx_hin_end
-        )
         
-        # 5. Reshape
-        maps = {
-            'fiber_fraction': raw_results[:, 0].reshape(X, Y, Z),
-            'restricted_fraction': raw_results[:, 1].reshape(X, Y, Z),
-            'hindered_fraction': raw_results[:, 2].reshape(X, Y, Z),
-            'water_fraction': raw_results[:, 3].reshape(X, Y, Z),
-            'r_squared': raw_results[:, 4].reshape(X, Y, Z)
-        }
-        return maps
+        f_fiber = np.sum(weights[:n_aniso])
+        iso_w = weights[n_aniso:]
+        
+        f_res = np.sum(iso_w[iso_diffs <= 0.3e-3])
+        f_hin = np.sum(iso_w[(iso_diffs > 0.3e-3) & (iso_diffs <= 2.0e-3)])
+        f_wat = np.sum(iso_w[iso_diffs > 2.0e-3])
+        
+        return DBSIParams(
+            f_restricted=f_res, f_hindered=f_hin, f_water=f_wat, f_fiber=f_fiber,
+            fiber_dir=np.zeros(3), axial_diffusivity=0, radial_diffusivity=0, r_squared=0
+        )
+
+    def fit_volume(self, volume, bvals, bvecs, mask=None, **kwargs):
+        """Non usata direttamente da TwoStep, ma utile se si usa solo Spectrum."""
+        pass 
