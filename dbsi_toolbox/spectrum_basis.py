@@ -8,7 +8,6 @@ from .common import DBSIParams
 class DBSI_BasisSpectrum(BaseDBSI):  
     """
     DBSI Basis Spectrum solver using standard Scipy NNLS.
-    References to Numba have been removed to ensure maximum stability and compatibility.
     """
     def __init__(self, 
                  iso_diffusivity_range=(0.0, 3.0e-3),
