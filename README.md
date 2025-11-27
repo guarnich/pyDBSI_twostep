@@ -36,7 +36,7 @@ This package is designed to be installed in "editable" mode, allowing for easy u
 1.  **Clone the Repository:**
 
     ```bash
-    git clone [https://github.com/guarnich/pyDBSI_twostep.git](https://github.com/guarnich/pyDBSI_twostep.git)
+    git clone https://github.com/guarnich/pyDBSI_twostep.git
     cd pyDBSI_twostep
     ```
 
