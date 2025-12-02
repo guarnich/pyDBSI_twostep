@@ -44,8 +44,11 @@ def load_dwi_data_dipy(
     return data, affine, gtab, mask_data
 
 def estimate_snr_rician_corrected(
-    b0_data: np.ndarray,
+    data: np.ndarray,
+    bvals: np.ndarray,
+    bvecs: np.ndarray,
     mask: np.ndarray,
+    b0_threshold: float = 50.0,
     max_iter: int = 5,
     convergence_tol: float = 0.01
 ) -> float:
@@ -57,15 +60,32 @@ def estimate_snr_rician_corrected(
     - Dietrich et al. (2007). "Measurement of SNR in MR images"
     
     Args:
-        b0_data: Array of b0 volumes (X, Y, Z, N_b0)
+        data: Full 4D DWI volume (X, Y, Z, N)
+        bvals: Array of b-values
+        bvecs: Array of gradient directions
         mask: Binary brain mask (X, Y, Z)
+        b0_threshold: Threshold to define b0 volumes (default 50)
         max_iter: Maximum iterations for correction
         convergence_tol: Convergence threshold
         
     Returns:
         Rician-corrected SNR estimate
     """
-    # Calculate temporal statistics
+    # 1. Identify and extract b0 volumes
+    bvals = np.array(bvals).flatten()
+    b0_indices = np.where(bvals <= b0_threshold)[0]
+    
+    # Check if enough b0 volumes exist
+    if len(b0_indices) < 2:
+        raise ValueError(
+            f"Cannot calculate temporal SNR: found only {len(b0_indices)} b0 volumes. "
+            "At least 2 are required."
+        )
+        
+    # Extract b0 data
+    b0_data = data[..., b0_indices]
+
+    # 2. Calculate temporal statistics
     mean_b0 = np.mean(b0_data, axis=-1)
     std_b0 = np.std(b0_data, axis=-1, ddof=1)  # Unbiased estimator
     
@@ -75,13 +95,13 @@ def estimate_snr_rician_corrected(
     # Initial apparent SNR
     snr_map = mean_b0 / std_b0
     
-    # Extract only masked voxels for efficiency
+    # 3. Extract only masked voxels for efficiency
     mask_indices = mask > 0
     snr_masked = snr_map[mask_indices]
     mean_masked = mean_b0[mask_indices]
     std_masked = std_b0[mask_indices]
     
-    # Iterative Rician correction
+    # 4. Iterative Rician correction
     # For Rician distribution: σ_true² = σ_obs² - μ²/(2·SNR²)
     snr_corrected = snr_masked.copy()
     
@@ -107,7 +127,7 @@ def estimate_snr_rician_corrected(
     # Use median (robust to outliers)
     final_snr = np.median(snr_corrected)
     
-    return final_snr
+    return float(final_snr)
 
 def estimate_snr(
     data: np.ndarray, 
@@ -137,10 +157,9 @@ def estimate_snr(
     """
     print("\n[Utils] Estimating SNR...")
     
-    # Extract b0 volumes
+    # Extract b0 volumes count for check
     b0_mask = gtab.b0s_mask
-    b0_data = data[..., b0_mask]
-    n_b0 = b0_data.shape[-1]
+    n_b0 = np.sum(b0_mask)
     
     if n_b0 == 0:
         print("  ! No b=0 volumes found. Using default SNR=20.0")
@@ -154,7 +173,13 @@ def estimate_snr(
         print(f"  → Method: Temporal + Rician Correction ({n_b0} b0 volumes)")
         
         try:
-            snr_estimate = estimate_snr_rician_corrected(b0_data, mask)
+            # UPDATED: Pass full data and let the function handle b0 extraction
+            snr_estimate = estimate_snr_rician_corrected(
+                data, 
+                gtab.bvals, 
+                gtab.bvecs, 
+                mask
+            )
             estimation_method = "temporal_rician"
             print(f"  ✓ Rician-Corrected SNR: {snr_estimate:.2f}")
             
@@ -163,6 +188,7 @@ def estimate_snr(
             print("  → Falling back to uncorrected temporal estimation...")
             
             # Fallback to simple temporal
+            b0_data = data[..., b0_mask]
             mean_b0 = np.mean(b0_data, axis=-1)
             std_b0 = np.std(b0_data, axis=-1, ddof=1)
             std_b0[std_b0 == 0] = 1e-10
@@ -178,6 +204,7 @@ def estimate_snr(
         print("  ! WARNING: Less accurate than temporal methods")
         
         try:
+            b0_data = data[..., b0_mask]
             b0_single = b0_data[..., 0]
             
             # Signal: Mean in brain
