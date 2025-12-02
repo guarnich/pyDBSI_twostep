@@ -3,8 +3,7 @@
 import os
 import numpy as np
 import nibabel as nib
-from typing import Tuple, Optional
-from typing import Optional, Dict
+from typing import Tuple, Optional, Dict
 
 # Import DIPY functions
 try:
