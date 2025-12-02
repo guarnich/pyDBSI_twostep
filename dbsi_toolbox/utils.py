@@ -4,6 +4,7 @@ import os
 import numpy as np
 import nibabel as nib
 from typing import Tuple, Optional, Dict
+import time
 
 # Import DIPY functions
 try:
@@ -11,8 +12,11 @@ try:
     from dipy.io import read_bvals_bvecs
     from dipy.core.gradients import gradient_table, GradientTable
     from dipy.segment.mask import median_otsu
+    
+    # Advanced Noise Estimation Imports
+    from dipy.denoise.noise_estimate import pca_noise_estimate, piesno
 except (ImportError, AttributeError):
-    print("WARNING: DIPY not found. Some utility functions may not work.")
+    print("WARNING: DIPY not found or incomplete. Some utility functions may not work.")
     GradientTable = type("GradientTable", (object,), {})
 
 def load_dwi_data_dipy(
@@ -53,23 +57,8 @@ def estimate_snr_rician_corrected(
     convergence_tol: float = 0.01
 ) -> float:
     """
-    Estimates SNR with Rician bias correction using iterative approach.
-    
-    Based on:
-    - Gudbjartsson & Patz (1995). "The Rician distribution of noisy MRI data"
-    - Dietrich et al. (2007). "Measurement of SNR in MR images"
-    
-    Args:
-        data: Full 4D DWI volume (X, Y, Z, N)
-        bvals: Array of b-values
-        bvecs: Array of gradient directions
-        mask: Binary brain mask (X, Y, Z)
-        b0_threshold: Threshold to define b0 volumes (default 50)
-        max_iter: Maximum iterations for correction
-        convergence_tol: Convergence threshold
-        
-    Returns:
-        Rician-corrected SNR estimate
+    Estimates SNR using Temporal Variance with Iterative Rician Bias Correction.
+    (This is the 'classic' method).
     """
     # 1. Identify and extract b0 volumes
     bvals = np.array(bvals).flatten()
@@ -77,17 +66,14 @@ def estimate_snr_rician_corrected(
     
     # Check if enough b0 volumes exist
     if len(b0_indices) < 2:
-        raise ValueError(
-            f"Cannot calculate temporal SNR: found only {len(b0_indices)} b0 volumes. "
-            "At least 2 are required."
-        )
+        return np.nan # Cannot compute
         
     # Extract b0 data
     b0_data = data[..., b0_indices]
 
     # 2. Calculate temporal statistics
     mean_b0 = np.mean(b0_data, axis=-1)
-    std_b0 = np.std(b0_data, axis=-1, ddof=1)  # Unbiased estimator
+    std_b0 = np.std(b0_data, axis=-1, ddof=1)
     
     # Avoid division by zero
     std_b0[std_b0 == 0] = 1e-10
@@ -102,7 +88,6 @@ def estimate_snr_rician_corrected(
     std_masked = std_b0[mask_indices]
     
     # 4. Iterative Rician correction
-    # For Rician distribution: σ_true² = σ_obs² - μ²/(2·SNR²)
     snr_corrected = snr_masked.copy()
     
     for iteration in range(max_iter):
@@ -113,7 +98,7 @@ def estimate_snr_rician_corrected(
         
         # Corrected variance
         var_corrected = std_masked**2 - bias_term
-        var_corrected[var_corrected < 0] = 1e-10  # Ensure positivity
+        var_corrected[var_corrected < 0] = 1e-10 
         
         # Updated SNR
         snr_corrected = mean_masked / np.sqrt(var_corrected)
@@ -121,138 +106,157 @@ def estimate_snr_rician_corrected(
         # Check convergence
         relative_change = np.median(np.abs(snr_corrected - snr_old) / (snr_old + 1e-10))
         if relative_change < convergence_tol:
-            print(f"  ✓ Rician correction converged at iteration {iteration + 1}")
             break
     
-    # Use median (robust to outliers)
-    final_snr = np.median(snr_corrected)
-    
-    return float(final_snr)
+    return float(np.median(snr_corrected))
 
 def estimate_snr(
     data: np.ndarray, 
     gtab: 'GradientTable', #type: ignore
     affine: np.ndarray,
     mask: np.ndarray,
-    method: str = 'temporal_rician'
+    method: str = 'auto'
 ) -> float:
     """
-    Estimates SNR with multiple fallback strategies.
+    Runs comprehensive SNR analysis comparing multiple methods:
+    1. MP-PCA (Marchenko-Pastur): Best for modern data, uses redundancy.
+    2. Temporal Rician: Classic method, requires multiple b0s.
+    3. PIESNO: Uses background noise, good if b0s are scarce.
     
-    Priority hierarchy:
-    1. Temporal + Rician correction (≥2 b0 volumes) [MOST ACCURATE]
-    2. Temporal only (≥2 b0 volumes, no correction)
-    3. Spatial estimation (single b0)
-    4. Default conservative value
-    
-    Args:
-        data: 4D DWI volume
-        gtab: DIPY gradient table
-        affine: NIfTI affine transformation
-        mask: Binary brain mask
-        method: 'temporal_rician', 'temporal', 'spatial', or 'auto'
-        
     Returns:
-        Estimated SNR value
+        The SNR value determined by the selected 'method' (or the best one if 'auto').
     """
-    print("\n[Utils] Estimating SNR...")
+    print("\n[Utils] Estimating SNR (Comprehensive Analysis)...")
     
-    # Extract b0 volumes count for check
     b0_mask = gtab.b0s_mask
     n_b0 = np.sum(b0_mask)
     
-    if n_b0 == 0:
-        print("  ! No b=0 volumes found. Using default SNR=20.0")
-        return 20.0
+    results = {}
     
-    snr_estimate = 20.0  # Default
-    estimation_method = "default"
-    
-    # --- METHOD 1: TEMPORAL + RICIAN (Best Practice) ---
-    if n_b0 >= 2 and method in ['temporal_rician', 'auto']:
-        print(f"  → Method: Temporal + Rician Correction ({n_b0} b0 volumes)")
+    # =========================================================
+    # 1. METHOD: MP-PCA (State of the Art)
+    # =========================================================
+    try:
+        start = time.time()
+        # MP-PCA estimates noise sigma voxel-wise using all volumes
+        sigma_mppca = pca_noise_estimate(data, gtab, verify_is_rotation=False)
         
-        try:
-            # UPDATED: Pass full data and let the function handle b0 extraction
-            snr_estimate = estimate_snr_rician_corrected(
-                data, 
-                gtab.bvals, 
-                gtab.bvecs, 
-                mask
-            )
-            estimation_method = "temporal_rician"
-            print(f"  ✓ Rician-Corrected SNR: {snr_estimate:.2f}")
+        # Calculate Signal (mean b0)
+        if n_b0 > 0:
+            S0 = np.mean(data[..., b0_mask], axis=-1)
+        else:
+            S0 = data[..., 0] # Fallback
             
-        except Exception as e:
-            print(f"  ! Rician correction failed: {e}")
-            print("  → Falling back to uncorrected temporal estimation...")
-            
-            # Fallback to simple temporal
-            b0_data = data[..., b0_mask]
-            mean_b0 = np.mean(b0_data, axis=-1)
-            std_b0 = np.std(b0_data, axis=-1, ddof=1)
-            std_b0[std_b0 == 0] = 1e-10
-            
-            snr_map = mean_b0 / std_b0
-            snr_estimate = np.median(snr_map[mask])
-            estimation_method = "temporal_simple"
-            print(f"  ✓ Temporal SNR (uncorrected): {snr_estimate:.2f}")
-    
-    # --- METHOD 2: SPATIAL ESTIMATION (Single b0) ---
-    elif n_b0 == 1 and method in ['spatial', 'auto']:
-        print("  → Method: Spatial (single b0 volume)")
-        print("  ! WARNING: Less accurate than temporal methods")
+        # SNR = Signal / Noise
+        snr_map_mppca = S0 / (sigma_mppca + 1e-12)
+        mppca_val = np.median(snr_map_mppca[mask])
         
-        try:
-            b0_data = data[..., b0_mask]
-            b0_single = b0_data[..., 0]
+        results['MP-PCA'] = {
+            'value': mppca_val,
+            'time': time.time() - start,
+            'desc': 'Local PCA (Robust)'
+        }
+    except Exception as e:
+        print(f"  ! MP-PCA skipped: {e}")
+        results['MP-PCA'] = {'value': np.nan, 'desc': 'Failed'}
+
+    # =========================================================
+    # 2. METHOD: TEMPORAL RICIAN (Classic)
+    # =========================================================
+    try:
+        start = time.time()
+        temp_val = estimate_snr_rician_corrected(data, gtab.bvals, gtab.bvecs, mask)
+        
+        desc = f"Temporal ({n_b0} b0s)"
+        if np.isnan(temp_val):
+            desc += " - Insufficient b0s"
             
-            # Signal: Mean in brain
-            signal_mean = np.mean(b0_single[mask])
+        results['Temporal'] = {
+            'value': temp_val,
+            'time': time.time() - start,
+            'desc': desc
+        }
+    except Exception as e:
+        results['Temporal'] = {'value': np.nan, 'desc': f'Error: {str(e)[:20]}'}
+
+    # =========================================================
+    # 3. METHOD: PIESNO (Background Noise)
+    # =========================================================
+    try:
+        start = time.time()
+        # PIESNO typically runs on a single volume (first b0)
+        if n_b0 > 0:
+            # Find index of first b0
+            first_b0_idx = np.where(b0_mask)[0][0]
+            b0_slice = data[..., first_b0_idx]
+        else:
+            b0_slice = data[..., 0]
+
+        sigma_piesno = piesno(b0_slice, N=1, return_mask=False)
+        
+        # Signal in mask
+        mean_signal = np.mean(b0_slice[mask])
+        piesno_val = mean_signal / (sigma_piesno + 1e-12)
+        
+        results['PIESNO'] = {
+            'value': piesno_val,
+            'time': time.time() - start,
+            'desc': 'Background Estimation'
+        }
+    except Exception as e:
+        results['PIESNO'] = {'value': np.nan, 'desc': f'Error: {str(e)[:20]}'}
+
+    # =========================================================
+    # REPORTING & DECISION
+    # =========================================================
+    print(f"\n  {'-'*70}")
+    print(f"  {'METHOD':<15} | {'SNR':<10} | {'TIME (s)':<10} | {'NOTES':<20}")
+    print(f"  {'-'*70}")
+    
+    for name, res in results.items():
+        val_str = f"{res['value']:.2f}" if not np.isnan(res['value']) else "N/A"
+        time_str = f"{res.get('time', 0):.2f}"
+        print(f"  {name:<15} | {val_str:<10} | {time_str:<10} | {res['desc']:<20}")
+    print(f"  {'-'*70}")
+
+    # Logic to choose the return value
+    final_snr = 20.0 # Ultimate fallback
+    selected_source = "default"
+
+    # Hierarchy of trust if 'auto'
+    if method in ['auto', 'compare', 'all']:
+        if not np.isnan(results['MP-PCA']['value']) and results['MP-PCA']['value'] > 0:
+            final_snr = results['MP-PCA']['value']
+            selected_source = "MP-PCA"
+        elif not np.isnan(results['Temporal']['value']) and results['Temporal']['value'] > 0:
+            final_snr = results['Temporal']['value']
+            selected_source = "Temporal"
+        elif not np.isnan(results['PIESNO']['value']) and results['PIESNO']['value'] > 0:
+            final_snr = results['PIESNO']['value']
+            selected_source = "PIESNO"
             
-            # Noise: Std in background corners (assume air/noise)
-            # Extract corner regions (assumed to be background)
-            corner_size = 10
-            corners = [
-                b0_single[:corner_size, :corner_size, :corner_size],
-                b0_single[-corner_size:, :corner_size, :corner_size],
-                b0_single[:corner_size, -corner_size:, :corner_size],
-                b0_single[-corner_size:, -corner_size:, :corner_size],
-            ]
-            noise_std = np.std(np.concatenate([c.ravel() for c in corners]))
-            
-            if noise_std > 0:
-                snr_estimate = signal_mean / noise_std
-                estimation_method = "spatial_background"
-                print(f"  ✓ Spatial SNR: {snr_estimate:.2f}")
-            else:
-                print("  ! Background noise estimation failed")
-                estimation_method = "default"
-                
-        except Exception as e:
-            print(f"  ! Spatial estimation failed: {e}")
-            estimation_method = "default"
-    
-    # --- FALLBACK ---
-    else:
-        print(f"  ! Cannot estimate SNR reliably (n_b0={n_b0}, method={method})")
-        print("  ! Using conservative default: SNR=20.0")
-        print("  ! Recommendation: Provide manual --snr value if known")
-    
-    # --- SAFETY BOUNDS ---
-    # Clamp to physiologically reasonable range
-    if snr_estimate < 3.0:
-        print(f"  ! Unusually low SNR detected ({snr_estimate:.1f}). Clamping to 3.0")
-        print("  ! Check data quality - very low SNR may indicate preprocessing issues")
-        snr_estimate = 3.0
-    elif snr_estimate > 150.0:
-        print(f"  ! Unusually high SNR detected ({snr_estimate:.1f}). Clamping to 150.0")
-        print("  ! This may indicate estimation error or post-processed data")
-        snr_estimate = 150.0
-    
-    print(f"\n  [Summary] Final SNR: {snr_estimate:.2f} (Method: {estimation_method})")
-    
-    return float(snr_estimate)
+    # Explicit selection
+    elif method.lower() == 'mppca' and not np.isnan(results['MP-PCA']['value']):
+        final_snr = results['MP-PCA']['value']
+        selected_source = "MP-PCA"
+    elif method.lower() == 'temporal' and not np.isnan(results['Temporal']['value']):
+        final_snr = results['Temporal']['value']
+        selected_source = "Temporal"
+    elif method.lower() == 'spatial' or method.lower() == 'piesno':
+         if not np.isnan(results['PIESNO']['value']):
+            final_snr = results['PIESNO']['value']
+            selected_source = "PIESNO"
+
+    # Safety clamping
+    if final_snr < 3.0: 
+        print("  ! WARNING: Very low SNR detected. Clamped to 3.0.")
+        final_snr = 3.0
+    if final_snr > 150.0:
+        print("  ! WARNING: Suspiciously high SNR. Clamped to 150.0.")
+        final_snr = 150.0
+
+    print(f"\n  ✓ Selected for Analysis: {final_snr:.2f} (Source: {selected_source})")
+    return float(final_snr)
 
 def save_parameter_maps(param_maps, affine, output_dir, prefix='dbsi'):
     """
@@ -285,20 +289,6 @@ def compute_validation_metrics(
 ) -> dict:
     """
     Computes validation metrics for comparison with ground truth.
-    
-    Standard metrics for methodological papers:
-    - RMSE (Root Mean Square Error)
-    - MAE (Mean Absolute Error)
-    - Bias (systematic error)
-    - Relative Error (percentage)
-    
-    Args:
-        fitted_params: Dictionary of fitted parameter maps
-        ground_truth: Dictionary of true parameter maps
-        mask: Optional mask to restrict analysis
-        
-    Returns:
-        Dictionary of metrics per parameter
     """
     metrics = {}
     
