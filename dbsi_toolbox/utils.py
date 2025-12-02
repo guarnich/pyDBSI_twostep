@@ -16,12 +16,20 @@ except (ImportError, AttributeError):
     print("WARNING: DIPY core functions not found. Data loading will fail.")
     GradientTable = type("GradientTable", (object,), {})
 
-# --- 2. ADVANCED IMPORTS (PIESNO only) ---
+# --- 2. ADVANCED IMPORTS (Noise Estimation) ---
+# Initialize as None to handle missing dependencies gracefully
+mppca = None
+piesno = None
+
+try:
+    from dipy.denoise.localpca import mppca
+except (ImportError, AttributeError):
+    pass
+
 try:
     from dipy.denoise.noise_estimate import piesno
 except (ImportError, AttributeError):
-    piesno = None
-    print("WARNING: 'piesno' not found in dipy.denoise.noise_estimate.")
+    pass
 
 def load_dwi_data_dipy(
     f_nifti: str, 
@@ -122,22 +130,59 @@ def estimate_snr(
     method: str = 'auto'
 ) -> float:
     """
-    Runs comprehensive SNR analysis comparing available methods:
-    1. Temporal Rician: Classic method, requires multiple b0s.
-    2. PIESNO: Uses background noise (DIPY), good if b0s are scarce.
+    Runs comprehensive SNR analysis comparing multiple methods:
+    1. MP-PCA (State of the Art): Uses redundancy in 4D data.
+    2. Temporal Rician: Classic method, requires multiple b0s.
+    3. PIESNO: Uses background noise, good if b0s are scarce.
     
     Returns:
-        The SNR value determined by the best available method.
+        The SNR value determined by the selected 'method' (or the best one if 'auto').
     """
-    print("\n[Utils] Estimating SNR (Standard vs PIESNO)...")
+    print("\n[Utils] Estimating SNR (Comprehensive Analysis)...")
     
     b0_mask = gtab.b0s_mask
     n_b0 = np.sum(b0_mask)
     
     results = {}
+    
+    # =========================================================
+    # 1. METHOD: MP-PCA (State of the Art)
+    # =========================================================
+    try:
+        start = time.time()
+        
+        if mppca is None:
+            raise ImportError("mppca function not found in dipy.denoise.localpca")
+
+        # MP-PCA with return_sigma=True returns (denoised_data, sigma_map)
+        # We only need the sigma_map for SNR estimation
+        # patch_radius=2 implies 5x5x5 patches (standard)
+        _, sigma_mppca = mppca(data, mask=mask, patch_radius=2, return_sigma=True)
+        
+        # Calculate Signal (mean b0)
+        if n_b0 > 0:
+            S0 = np.mean(data[..., b0_mask], axis=-1)
+        else:
+            S0 = data[..., 0] # Fallback
+            
+        # SNR = Signal / Noise
+        snr_map_mppca = S0 / (sigma_mppca + 1e-12)
+        
+        # Use median in mask
+        mppca_val = np.median(snr_map_mppca[mask])
+        
+        results['MP-PCA'] = {
+            'value': mppca_val,
+            'time': time.time() - start,
+            'desc': 'Local PCA (Robust)'
+        }
+    except Exception as e:
+        desc = "Not installed" if "not found" in str(e) else "Failed"
+        results['MP-PCA'] = {'value': np.nan, 'desc': desc}
+        # print(f"DEBUG MP-PCA: {e}")
 
     # =========================================================
-    # 1. METHOD: TEMPORAL RICIAN (Classic)
+    # 2. METHOD: TEMPORAL RICIAN (Classic)
     # =========================================================
     try:
         start = time.time()
@@ -153,10 +198,10 @@ def estimate_snr(
             'desc': desc
         }
     except Exception as e:
-        results['Temporal'] = {'value': np.nan, 'desc': f'Error'}
+        results['Temporal'] = {'value': np.nan, 'desc': 'Error'}
 
     # =========================================================
-    # 2. METHOD: PIESNO (Background Noise)
+    # 3. METHOD: PIESNO (Background Noise)
     # =========================================================
     try:
         start = time.time()
@@ -166,22 +211,16 @@ def estimate_snr(
 
         # PIESNO typically runs on a single volume (first b0)
         if n_b0 > 0:
-            # Find index of first b0
             first_b0_idx = np.where(b0_mask)[0][0]
             b0_slice = data[..., first_b0_idx]
         else:
             b0_slice = data[..., 0]
 
-        # PIESNO returns sigma. We want SNR = Signal / Sigma
         sigma_piesno = piesno(b0_slice, N=1, return_mask=False)
         
-        # Signal estimate: Mean inside the brain mask
+        # Signal in mask
         mean_signal = np.mean(b0_slice[mask])
-        
-        # Avoid division by zero
-        if sigma_piesno <= 0: sigma_piesno = 1e-10
-            
-        piesno_val = mean_signal / sigma_piesno
+        piesno_val = mean_signal / (sigma_piesno + 1e-12)
         
         results['PIESNO'] = {
             'value': piesno_val,
@@ -194,15 +233,15 @@ def estimate_snr(
     # =========================================================
     # REPORTING & DECISION
     # =========================================================
-    print(f"\n  {'-'*70}")
-    print(f"  {'METHOD':<15} | {'SNR':<10} | {'TIME (s)':<10} | {'NOTES':<20}")
-    print(f"  {'-'*70}")
+    print(f"\n  {'-'*75}")
+    print(f"  {'METHOD':<15} | {'SNR':<10} | {'TIME (s)':<10} | {'NOTES':<25}")
+    print(f"  {'-'*75}")
     
     for name, res in results.items():
         val_str = f"{res['value']:.2f}" if not np.isnan(res['value']) else "N/A"
         time_str = f"{res.get('time', 0):.2f}"
-        print(f"  {name:<15} | {val_str:<10} | {time_str:<10} | {res['desc']:<20}")
-    print(f"  {'-'*70}")
+        print(f"  {name:<15} | {val_str:<10} | {time_str:<10} | {res['desc']:<25}")
+    print(f"  {'-'*75}")
 
     # Logic to choose the return value
     final_snr = 20.0 # Ultimate fallback
@@ -210,16 +249,23 @@ def estimate_snr(
 
     # Hierarchy of trust if 'auto'
     if method in ['auto', 'compare', 'all']:
-        # Prefer Temporal Rician if valid (Specific to tissue)
-        if not np.isnan(results['Temporal']['value']) and results['Temporal']['value'] > 0:
+        # 1. Prefer MP-PCA (Most robust modern method)
+        if not np.isnan(results['MP-PCA']['value']) and results['MP-PCA']['value'] > 0:
+            final_snr = results['MP-PCA']['value']
+            selected_source = "MP-PCA"
+        # 2. Fallback to Temporal Rician (Good if multiple b0s exist)
+        elif not np.isnan(results['Temporal']['value']) and results['Temporal']['value'] > 0:
             final_snr = results['Temporal']['value']
             selected_source = "Temporal"
-        # Fallback to PIESNO (Background based)
+        # 3. Fallback to PIESNO (Background based)
         elif not np.isnan(results['PIESNO']['value']) and results['PIESNO']['value'] > 0:
             final_snr = results['PIESNO']['value']
             selected_source = "PIESNO"
             
-    # Explicit selection
+    # Explicit selection overrides
+    elif method.lower() == 'mppca' and not np.isnan(results['MP-PCA']['value']):
+        final_snr = results['MP-PCA']['value']
+        selected_source = "MP-PCA"
     elif method.lower() == 'temporal' and not np.isnan(results['Temporal']['value']):
         final_snr = results['Temporal']['value']
         selected_source = "Temporal"
