@@ -6,7 +6,7 @@ import nibabel as nib
 from typing import Tuple, Optional, Dict
 import time
 
-# --- 1. BASIC IMPORTS (Essential) ---
+# --- BASIC IMPORTS ---
 try:
     from dipy.io.image import load_nifti
     from dipy.io import read_bvals_bvecs
@@ -15,21 +15,6 @@ try:
 except (ImportError, AttributeError):
     print("WARNING: DIPY core functions not found. Data loading will fail.")
     GradientTable = type("GradientTable", (object,), {})
-
-# --- 2. ADVANCED IMPORTS (Noise Estimation) ---
-# Initialize as None to handle missing dependencies gracefully
-mppca = None
-piesno = None
-
-try:
-    from dipy.denoise.localpca import mppca
-except (ImportError, AttributeError):
-    pass
-
-try:
-    from dipy.denoise.noise_estimate import piesno
-except (ImportError, AttributeError):
-    pass
 
 def load_dwi_data_dipy(
     f_nifti: str, 
@@ -70,7 +55,6 @@ def estimate_snr_rician_corrected(
 ) -> float:
     """
     Estimates SNR using Temporal Variance with Iterative Rician Bias Correction.
-    (This is the 'classic' method).
     """
     # 1. Identify and extract b0 volumes
     bvals = np.array(bvals).flatten()
@@ -78,12 +62,13 @@ def estimate_snr_rician_corrected(
     
     # Check if enough b0 volumes exist
     if len(b0_indices) < 2:
-        return np.nan # Cannot compute
+        # Cannot compute temporal SNR with fewer than 2 volumes
+        return np.nan 
         
     # Extract b0 data
     b0_data = data[..., b0_indices]
 
-    # 2. Calculate temporal statistics
+    # 2. Calculate temporal statistics (voxel-wise)
     mean_b0 = np.mean(b0_data, axis=-1)
     std_b0 = np.std(b0_data, axis=-1, ddof=1)
     
@@ -100,6 +85,7 @@ def estimate_snr_rician_corrected(
     std_masked = std_b0[mask_indices]
     
     # 4. Iterative Rician correction
+    # (Removes the bias introduced by Rician noise at low SNR)
     snr_corrected = snr_masked.copy()
     
     for iteration in range(max_iter):
@@ -127,163 +113,57 @@ def estimate_snr(
     gtab: 'GradientTable', #type: ignore
     affine: np.ndarray,
     mask: np.ndarray,
-    method: str = 'auto'
+    method: str = 'temporal_rician' # Fixed to this method
 ) -> float:
     """
-    Runs comprehensive SNR analysis comparing multiple methods:
-    1. MP-PCA (State of the Art): Uses redundancy in 4D data.
-    2. Temporal Rician: Classic method, requires multiple b0s.
-    3. PIESNO: Uses background noise, good if b0s are scarce.
-    
-    Returns:
-        The SNR value determined by the selected 'method' (or the best one if 'auto').
+    Estimates SNR using ONLY the Temporal Rician method.
+    NO spatial fallback is applied.
     """
-    print("\n[Utils] Estimating SNR (Comprehensive Analysis)...")
+    print("\n[Utils] Estimating SNR (Strict Temporal + Rician)...")
     
     b0_mask = gtab.b0s_mask
     n_b0 = np.sum(b0_mask)
     
-    results = {}
-    
-    # =========================================================
-    # 1. METHOD: MP-PCA (State of the Art)
-    # =========================================================
-    try:
-        start = time.time()
-        
-        if mppca is None:
-            raise ImportError("mppca function not found in dipy.denoise.localpca")
+    # --- STRICT CHECK ---
+    if n_b0 < 2:
+        print(f"  [CRITICAL ERROR] Found only {n_b0} b0 volumes.")
+        print("  ! This method STRICTLY requires >= 2 b0 volumes to estimate temporal variance.")
+        print("  ! Returning default SNR = 20.0 to allow pipeline to proceed (but check your data!).")
+        return 20.0
 
-        # MP-PCA with return_sigma=True returns (denoised_data, sigma_map)
-        # We only need the sigma_map for SNR estimation
-        # patch_radius=2 implies 5x5x5 patches (standard)
-        _, sigma_mppca = mppca(data, mask=mask, patch_radius=2, return_sigma=True)
+    snr_estimate = 20.0
+    estimation_source = "Default"
+
+    # --- EXECUTE METHOD ---
+    try:
+        print(f"  → Analyzing {n_b0} b0 volumes...")
+        val = estimate_snr_rician_corrected(data, gtab.bvals, gtab.bvecs, mask)
         
-        # Calculate Signal (mean b0)
-        if n_b0 > 0:
-            S0 = np.mean(data[..., b0_mask], axis=-1)
+        if np.isnan(val) or val <= 0:
+            print("  ! Computation failed (result was NaN or <= 0).")
+            print("  ! Using default SNR = 20.0")
+            snr_estimate = 20.0
         else:
-            S0 = data[..., 0] # Fallback
+            snr_estimate = val
+            estimation_source = "Temporal Rician"
+            print(f"  ✓ Calculated SNR: {snr_estimate:.2f}")
             
-        # SNR = Signal / Noise
-        snr_map_mppca = S0 / (sigma_mppca + 1e-12)
-        
-        # Use median in mask
-        mppca_val = np.median(snr_map_mppca[mask])
-        
-        results['MP-PCA'] = {
-            'value': mppca_val,
-            'time': time.time() - start,
-            'desc': 'Local PCA (Robust)'
-        }
     except Exception as e:
-        desc = "Not installed" if "not found" in str(e) else "Failed"
-        results['MP-PCA'] = {'value': np.nan, 'desc': desc}
-        # print(f"DEBUG MP-PCA: {e}")
+         print(f"  ! Error during calculation: {e}")
+         print("  ! Using default SNR = 20.0")
+         snr_estimate = 20.0
 
-    # =========================================================
-    # 2. METHOD: TEMPORAL RICIAN (Classic)
-    # =========================================================
-    try:
-        start = time.time()
-        temp_val = estimate_snr_rician_corrected(data, gtab.bvals, gtab.bvecs, mask)
-        
-        desc = f"Temporal ({n_b0} b0s)"
-        if np.isnan(temp_val):
-            desc += " - Insufficient b0s"
-            
-        results['Temporal'] = {
-            'value': temp_val,
-            'time': time.time() - start,
-            'desc': desc
-        }
-    except Exception as e:
-        results['Temporal'] = {'value': np.nan, 'desc': 'Error'}
+    # --- SAFETY BOUNDS ---
+    # Even with strict method, we clamp extreme outliers to avoid blowing up the DBSI fit
+    if snr_estimate < 3.0: 
+        print("  ! WARNING: Very low SNR detected (<3.0). Clamped to 3.0.")
+        snr_estimate = 3.0
+    if snr_estimate > 150.0:
+        print("  ! WARNING: High SNR detected (>150). Clamped to 150.0.")
+        snr_estimate = 150.0
 
-    # =========================================================
-    # 3. METHOD: PIESNO (Background Noise)
-    # =========================================================
-    try:
-        start = time.time()
-        
-        if piesno is None:
-             raise ImportError("Function not available")
-
-        # PIESNO typically runs on a single volume (first b0)
-        if n_b0 > 0:
-            first_b0_idx = np.where(b0_mask)[0][0]
-            b0_slice = data[..., first_b0_idx]
-        else:
-            b0_slice = data[..., 0]
-
-        sigma_piesno = piesno(b0_slice, N=1, return_mask=False)
-        
-        # Signal in mask
-        mean_signal = np.mean(b0_slice[mask])
-        piesno_val = mean_signal / (sigma_piesno + 1e-12)
-        
-        results['PIESNO'] = {
-            'value': piesno_val,
-            'time': time.time() - start,
-            'desc': 'Background Estimation'
-        }
-    except Exception as e:
-        results['PIESNO'] = {'value': np.nan, 'desc': 'Not available' if 'available' in str(e) else 'Failed'}
-
-    # =========================================================
-    # REPORTING & DECISION
-    # =========================================================
-    print(f"\n  {'-'*75}")
-    print(f"  {'METHOD':<15} | {'SNR':<10} | {'TIME (s)':<10} | {'NOTES':<25}")
-    print(f"  {'-'*75}")
-    
-    for name, res in results.items():
-        val_str = f"{res['value']:.2f}" if not np.isnan(res['value']) else "N/A"
-        time_str = f"{res.get('time', 0):.2f}"
-        print(f"  {name:<15} | {val_str:<10} | {time_str:<10} | {res['desc']:<25}")
-    print(f"  {'-'*75}")
-
-    # Logic to choose the return value
-    final_snr = 20.0 # Ultimate fallback
-    selected_source = "default"
-
-    # Hierarchy of trust if 'auto'
-    if method in ['auto', 'compare', 'all']:
-        # 1. Prefer MP-PCA (Most robust modern method)
-        if not np.isnan(results['MP-PCA']['value']) and results['MP-PCA']['value'] > 0:
-            final_snr = results['MP-PCA']['value']
-            selected_source = "MP-PCA"
-        # 2. Fallback to Temporal Rician (Good if multiple b0s exist)
-        elif not np.isnan(results['Temporal']['value']) and results['Temporal']['value'] > 0:
-            final_snr = results['Temporal']['value']
-            selected_source = "Temporal"
-        # 3. Fallback to PIESNO (Background based)
-        elif not np.isnan(results['PIESNO']['value']) and results['PIESNO']['value'] > 0:
-            final_snr = results['PIESNO']['value']
-            selected_source = "PIESNO"
-            
-    # Explicit selection overrides
-    elif method.lower() == 'mppca' and not np.isnan(results['MP-PCA']['value']):
-        final_snr = results['MP-PCA']['value']
-        selected_source = "MP-PCA"
-    elif method.lower() == 'temporal' and not np.isnan(results['Temporal']['value']):
-        final_snr = results['Temporal']['value']
-        selected_source = "Temporal"
-    elif method.lower() == 'spatial' or method.lower() == 'piesno':
-         if not np.isnan(results['PIESNO']['value']):
-            final_snr = results['PIESNO']['value']
-            selected_source = "PIESNO"
-
-    # Safety clamping
-    if final_snr < 3.0: 
-        print("  ! WARNING: Very low SNR detected. Clamped to 3.0.")
-        final_snr = 3.0
-    if final_snr > 150.0:
-        print("  ! WARNING: Suspiciously high SNR. Clamped to 150.0.")
-        final_snr = 150.0
-
-    print(f"\n  ✓ Selected for Analysis: {final_snr:.2f} (Source: {selected_source})")
-    return float(final_snr)
+    print(f"  [Result] Final SNR: {snr_estimate:.2f} (Source: {estimation_source})")
+    return float(snr_estimate)
 
 def save_parameter_maps(param_maps, affine, output_dir, prefix='dbsi'):
     """
